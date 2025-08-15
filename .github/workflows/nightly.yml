@@ -1,9 +1,9 @@
-name: Nightly Canvas Export (Filtered)
+name: Nightly Canvas Export
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # runs daily at 02:00 UTC
-  workflow_dispatch:
+    - cron: "0 2 * * *"  # Every day at 02:00 UTC
+  workflow_dispatch:      # Allow manual run from GitHub
 
 jobs:
   run-export:
@@ -11,39 +11,27 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      # Export ONLY the students listed in the INCLUDE_CANVAS_IDS secret
-      - name: Run Canvas Export (filtered)
+      - name: Run Canvas Export
         env:
-          API_URL:  ${{ secrets.CANVAS_API_URL }}
-          API_KEY:  ${{ secrets.CANVAS_API_KEY }}
-          IDS:      ${{ secrets.INCLUDE_CANVAS_IDS }}   # e.g. 796,797,884,903
+          API_URL: ${{ secrets.CANVAS_API_URL }}
+          API_KEY: ${{ secrets.CANVAS_API_KEY }}
         run: |
-          # Write the output to the SAME filename we'll upsert
           python canvas_export_enrollment_b2c_final_2.py \
             --api-url "$API_URL" \
             --api-key "$API_KEY" \
             --account-id self \
-            --out "Canvas_Enrollment_Courses.csv" \
-            --include-assignments \
-            --include-canvas-ids "$IDS"
-
-      - name: Upload CSV as artifact (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: canvas-csvs
-          path: Canvas_Enrollment_Courses.csv
+            --out "Canvas" \
+            --include-assignments
 
       - name: Upsert Enrollment Courses → Airtable
         env:
@@ -56,4 +44,5 @@ jobs:
             --table "$AIRTABLE_TABLE_NAME" \
             --token "$AIRTABLE_PAT" \
             --csv "Canvas_Enrollment_Courses.csv" \
-            --unique-field "Enrollment Course Key"
+            --unique-field "Enrollment Course Key" \
+            --typecast
