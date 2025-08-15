@@ -11,10 +11,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -30,6 +30,28 @@ jobs:
             --api-url "$API_URL" \
             --api-key "$API_KEY" \
             --account-id self \
-            --out-prefix Students_AllInOne \
-            --include-assignments
+            --out-prefix "Canvas" \
+            --include-assignments \
+            --exclude-assignment-names "End of Unit Feedback (Mandatory)" \
+            --exclude-assignment-contains "NPS|feedback|survey"
 
+      - name: Upload CSVs as artifacts (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-csvs
+          path: |
+            Canvas_Enrollments.csv
+            Canvas_Enrollment_Courses.csv
+
+      - name: Upsert Enrollment Courses → Airtable
+        env:
+          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
+        run: |
+          python airtable_upsert.py \
+            --base "$AIRTABLE_BASE_ID" \
+            --table "$AIRTABLE_TABLE_NAME" \
+            --token "$AIRTABLE_PAT" \
+            --csv "Canvas_Enrollment_Courses.csv" \
+            --unique-field "Enrollment Course Key"
