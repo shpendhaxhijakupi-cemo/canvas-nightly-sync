@@ -3,7 +3,7 @@ name: Nightly Canvas Export (Filtered)
 on:
   schedule:
     - cron: "0 2 * * *"   # runs daily at 02:00 UTC
-  workflow_dispatch:       # allow manual run from GitHub
+  workflow_dispatch:
 
 jobs:
   run-export:
@@ -38,14 +38,40 @@ jobs:
             --include-assignments \
             --include-canvas-ids "$INCLUDE_IDS"
 
-      # Optional: keep the CSVs as workflow artifacts for auditing / download
+      # === Discover the actual CSV filenames the script produced ===
+      - name: Discover CSV outputs
+        id: discover
+        shell: bash
+        run: |
+          echo "Workspace listing:"
+          ls -la
+          echo
+
+          # Try to find per-course CSV and per-year CSV by pattern
+          COURSES=$(ls -1 *Enrollment_Courses*.csv 2>/dev/null | head -n1 || true)
+          ENRS=$(ls -1 *Enrollments*.csv 2>/dev/null | head -n1 || true)
+
+          echo "Detected courses CSV: ${COURSES:-<none>}"
+          echo "Detected enrollments CSV: ${ENRS:-<none>}"
+
+          # Export to environment for later steps
+          echo "COURSES_CSV=$COURSES" >> $GITHUB_ENV
+          echo "ENROLLMENTS_CSV=$ENRS" >> $GITHUB_ENV
+
+          # Fail early if we can't find the courses CSV
+          if [ -z "$COURSES" ]; then
+            echo "ERROR: Could not find a file matching *Enrollment_Courses*.csv"
+            echo "Check your script's output filenames above."
+            exit 1
+          fi
+
+      # Optional: keep whatever CSVs were created as artifacts
       - name: Upload CSVs as artifacts (optional)
         uses: actions/upload-artifact@v4
         with:
           name: canvas-csvs
           path: |
-            Canvas_Enrollments.csv
-            Canvas_Enrollment_Courses.csv
+            *.csv
 
       # === Upsert per-course CSV into Airtable ===
       - name: Upsert Enrollment Courses → Airtable
@@ -54,9 +80,10 @@ jobs:
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
         run: |
+          echo "Using courses CSV: $COURSES_CSV"
           python airtable_upsert.py \
             --base "$AIRTABLE_BASE_ID" \
             --table "$AIRTABLE_TABLE_NAME" \
             --token "$AIRTABLE_PAT" \
-            --csv "Canvas_Enrollment_Courses.csv" \
+            --csv "$COURSES_CSV" \
             --unique-field "Enrollment Course Key"
