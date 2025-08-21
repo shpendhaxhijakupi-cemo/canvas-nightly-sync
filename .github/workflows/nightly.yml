@@ -33,11 +33,12 @@ jobs:
             --out-prefix Students_AllInOne \
             --include-assignments
 
-      - name: Upload CSVs as artifacts (optional)
-        uses: actions/upload-artifact@v3
-        with:
-          name: csv-outputs
-          path: "*.csv"
+- name: Upload CSVs as artifacts (optional)
+  uses: actions/upload-artifact@v4
+  with:
+    name: csv-outputs
+    path: "*.csv"
+
 
       - name: Upsert Enrollment Courses → Airtable
         env:
