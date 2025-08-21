@@ -1,9 +1,9 @@
-name: Nightly Canvas Export (Courses Only)
+name: Nightly Canvas Export
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # daily at 02:00 UTC
-  workflow_dispatch:
+    - cron: "0 2 * * *"   # Every day at 02:00 UTC
+  workflow_dispatch:       # Allow manual run
 
 jobs:
   run-export:
@@ -19,172 +19,98 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # requests is used by the inline exporter below
-          pip install requests
+        run: pip install -r requirements.txt
 
-      # (Optional) still run your summary exporter if you want the student sheet too
-      - name: Run your summary exporter (optional)
-        continue-on-error: true
+      - name: Run Canvas Export (filtered)
         env:
-          API_URL:  ${{ secrets.CANVAS_API_URL }}
-          API_KEY:  ${{ secrets.CANVAS_API_KEY }}
-          IDS:      ${{ secrets.INCLUDE_CANVAS_IDS }}
+          API_URL: ${{ secrets.CANVAS_API_URL }}
+          API_KEY: ${{ secrets.CANVAS_API_KEY }}
         run: |
           python canvas_export_enrollment_b2c_final_2.py \
             --api-url "$API_URL" \
             --api-key "$API_KEY" \
             --account-id self \
-            --out "Students_AllInOne.csv" \
-            --include-assignments \
-            --include-canvas-ids "$IDS"
+            --include-assignments
 
-      # === Generate the PER-COURSE CSV directly from Canvas ===
       - name: Build per-course CSV for Airtable
-        env:
-          API_URL:  ${{ secrets.CANVAS_API_URL }}
-          API_KEY:  ${{ secrets.CANVAS_API_KEY }}
-          IDS:      ${{ secrets.INCLUDE_CANVAS_IDS }}   # e.g. "796,797,884"
         run: |
-          python - <<'PY'
-          import csv, os, sys, time
+          python - <<'EOF'
+          import csv, os
           from datetime import datetime
-          import requests
 
-          API_URL = os.environ["API_URL"].rstrip("/")
-          API_KEY = os.environ["API_KEY"]
-          IDS = [s.strip() for s in os.environ.get("IDS","").split(",") if s.strip()]
-          HEADERS = {"Authorization": f"Bearer {API_KEY}"}
-          PER_PAGE = 100
-          START_MONTH = 8  # school year start (Aug)
+          input_file = "Canvas_Enrollments.csv"
+          output_file = "Canvas_Enrollment_Courses.csv"
 
-          def iso(dt):
-              return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
+          START_MONTH = 9  # adjust if your school year begins in a different month
 
-          def school_year(dt):
-              if not dt: return ""
-              y = dt.year
-              return f"{y-1}-{y}" if dt.month < START_MONTH else f"{y}-{y+1}"
+          if not os.path.exists(input_file):
+              print(f"[fatal] Input file {input_file} not found")
+              exit(1)
 
-          def paged(url, params=None):
-              params = dict(params or {})
-              while True:
-                  r = requests.get(url, headers=HEADERS, params=params, timeout=60)
-                  if r.status_code in (429,500,502,503,504):
-                      time.sleep(1); continue
-                  r.raise_for_status()
-                  data = r.json()
-                  if isinstance(data, list):
-                      for x in data: yield x
-                  else:
-                      yield data
-                  link = r.headers.get("Link","")
-                  nxt = None
-                  for part in link.split(","):
-                      if 'rel="next"' in part:
-                          nxt = part[part.find("<")+1: part.find(">")]
-                          break
-                  if not nxt: break
-                  url, params = nxt, None
+          with open(input_file, newline='', encoding="utf-8") as f:
+              rows = list(csv.DictReader(f))
 
-          # Write output
-          out = "Canvas_Enrollment_Courses.csv"
-          with open(out, "w", newline="", encoding="utf-8") as f:
-              w = csv.writer(f)
+          with open(output_file, "w", newline='', encoding="utf-8") as out:
+              w = csv.writer(out)
               w.writerow([
                   "Enrollment Course Key","Enrollment Key","Student Canvas ID","Student Name",
-                  "School Year","Course ID","Course Code","Course Name",
+                  "School Year Label","School Year Start Date","Course ID","Course Code","Course Name",
                   "Course Start Date","Course End Date","Assigned Teachers",
                   "Current Score","Final Score","Passed?"
               ])
 
-              # iterate students
-              for uid in IDS:
-                  try:
-                      # get basic name
-                      prof = requests.get(f"{API_URL}/users/{uid}/profile", headers=HEADERS, timeout=30)
-                      if prof.ok:
-                          name = (prof.json().get("name") or "").strip()
-                      else:
-                          name = f"User {uid}"
+              for row in rows:
+                  uid = row.get("user_id")
+                  cid = row.get("course_id")
+                  name = f"{row.get('user_name')}"
+                  enr_key = row.get("enrollment_id") or ""
+                  key = f"{uid}-{cid}"
 
-                      # enrollments with grades
-                      for enr in paged(f"{API_URL}/users/{uid}/enrollments",
-                                       {"type[]":"StudentEnrollment","include[]":"grades","per_page":PER_PAGE}):
-                          cid = enr.get("course_id")
-                          if not cid: continue
-                          grades = enr.get("grades") or {}
-                          cur = grades.get("current_score")
-                          fin = grades.get("final_score")
+                  # derive School Year label + start date
+                  sy = row.get("school_year") or ""
+                  sy_label, sy_start = sy, ""
+                  if sy and "-" in sy:
+                      try:
+                          start_year = int(sy.split("-")[0])
+                          sy_start = datetime(start_year, START_MONTH, 1).isoformat()
+                      except:
+                          pass
 
-                          # course info
-                          c = requests.get(f"{API_URL}/courses/{cid}", headers=HEADERS, timeout=60)
-                          if not c.ok: 
-                              course = {}
-                          else:
-                              course = c.json()
+                  cstart = row.get("course_start_at")
+                  cend = row.get("course_end_at")
+                  teachers = row.get("teachers") or ""
+                  cur = row.get("current_score")
+                  fin = row.get("final_score")
+                  passed = row.get("passed")
 
-                          cstart = iso(course.get("start_at")) or iso(enr.get("start_at"))
-                          cend   = iso(course.get("end_at")) or iso(enr.get("end_at"))
-                          sy = school_year(cstart or iso(enr.get("created_at")))
+                  w.writerow([
+                      key, enr_key, uid, name,
+                      sy_label, sy_start,
+                      cid,
+                      row.get("course_code") or "",
+                      row.get("course_name") or "",
+                      cstart, cend,
+                      teachers, cur or "", fin or "", passed or ""
+                  ])
 
-                          # teachers
-                          tnames = []
-                          for t in paged(f"{API_URL}/courses/{cid}/enrollments",
-                                         {"type[]":"TeacherEnrollment","per_page":PER_PAGE}):
-                              u = t.get("user") or {}
-                              nm = u.get("name") or u.get("sortable_name")
-                              if nm: tnames.append(nm)
-                          tnames = sorted(set(tnames))
-                          teachers = ", ".join(tnames)
+          print(f"[done] Wrote {len(rows)} rows to {output_file}")
+          EOF
 
-                          key = f"{uid}-{sy}-{cid}"
-                          enr_key = f"{uid}-{sy}"
-
-                          passed = ""
-                          try:
-                              if fin is not None:
-                                  passed = "Yes" if float(fin) >= 60.0 else "No"
-                          except Exception:
-                              passed = ""
-
-                          w.writerow([
-                              key, enr_key, uid, name, sy, cid,
-                              course.get("course_code") or "",
-                              course.get("name") or "",
-                              cstart.isoformat() if cstart else "",
-                              cend.isoformat() if cend else "",
-                              teachers,
-                              cur if cur is not None else "",
-                              fin if fin is not None else "",
-                              passed
-                          ])
-                  except Exception as e:
-                      print(f"[warn] failed student {uid}: {e}", file=sys.stderr)
-                      continue
-
-          print("[ok] Wrote Canvas_Enrollment_Courses.csv")
-          PY
-
-      - name: Upload CSVs as artifacts
+      - name: Upload CSVs as artifacts (optional)
         uses: actions/upload-artifact@v4
         with:
-          name: canvas-csvs
-          path: |
-            *.csv
+          name: csv-exports
+          path: "*.csv"
 
       - name: Upsert Enrollment Courses → Airtable
         env:
-          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
-          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}  # "B2C Courses Enrollment"
+          AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
         run: |
           python airtable_upsert.py \
             --base "$AIRTABLE_BASE_ID" \
             --table "$AIRTABLE_TABLE_NAME" \
             --token "$AIRTABLE_PAT" \
             --csv "Canvas_Enrollment_Courses.csv" \
-            --unique-field "Enrollment Course Key" \
-            --typecast
+            --unique-field "Enrollment Course Key"
