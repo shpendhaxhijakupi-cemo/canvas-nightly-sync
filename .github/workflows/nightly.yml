@@ -2,8 +2,8 @@ name: Nightly Canvas Export
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # Every day at 02:00 UTC
-  workflow_dispatch:       # Allow manual run
+    - cron: "0 2 * * *"  # Every day at 02:00 UTC
+  workflow_dispatch:      # Allow manual run from GitHub
 
 jobs:
   run-export:
@@ -11,10 +11,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: "3.12"
 
@@ -30,76 +30,13 @@ jobs:
             --api-url "$API_URL" \
             --api-key "$API_KEY" \
             --account-id self \
+            --out-prefix Students_AllInOne \
             --include-assignments
 
-      - name: Build per-course CSV for Airtable
-        run: |
-          python - <<'EOF'
-          import csv, os
-          from datetime import datetime
-
-          input_file = "Canvas_Enrollments.csv"
-          output_file = "Canvas_Enrollment_Courses.csv"
-
-          START_MONTH = 9  # adjust if your school year begins in a different month
-
-          if not os.path.exists(input_file):
-              print(f"[fatal] Input file {input_file} not found")
-              exit(1)
-
-          with open(input_file, newline='', encoding="utf-8") as f:
-              rows = list(csv.DictReader(f))
-
-          with open(output_file, "w", newline='', encoding="utf-8") as out:
-              w = csv.writer(out)
-              w.writerow([
-                  "Enrollment Course Key","Enrollment Key","Student Canvas ID","Student Name",
-                  "School Year Label","School Year Start Date","Course ID","Course Code","Course Name",
-                  "Course Start Date","Course End Date","Assigned Teachers",
-                  "Current Score","Final Score","Passed?"
-              ])
-
-              for row in rows:
-                  uid = row.get("user_id")
-                  cid = row.get("course_id")
-                  name = f"{row.get('user_name')}"
-                  enr_key = row.get("enrollment_id") or ""
-                  key = f"{uid}-{cid}"
-
-                  # derive School Year label + start date
-                  sy = row.get("school_year") or ""
-                  sy_label, sy_start = sy, ""
-                  if sy and "-" in sy:
-                      try:
-                          start_year = int(sy.split("-")[0])
-                          sy_start = datetime(start_year, START_MONTH, 1).isoformat()
-                      except:
-                          pass
-
-                  cstart = row.get("course_start_at")
-                  cend = row.get("course_end_at")
-                  teachers = row.get("teachers") or ""
-                  cur = row.get("current_score")
-                  fin = row.get("final_score")
-                  passed = row.get("passed")
-
-                  w.writerow([
-                      key, enr_key, uid, name,
-                      sy_label, sy_start,
-                      cid,
-                      row.get("course_code") or "",
-                      row.get("course_name") or "",
-                      cstart, cend,
-                      teachers, cur or "", fin or "", passed or ""
-                  ])
-
-          print(f"[done] Wrote {len(rows)} rows to {output_file}")
-          EOF
-
       - name: Upload CSVs as artifacts (optional)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
-          name: csv-exports
+          name: csv-outputs
           path: "*.csv"
 
       - name: Upsert Enrollment Courses → Airtable
@@ -112,5 +49,5 @@ jobs:
             --base "$AIRTABLE_BASE_ID" \
             --table "$AIRTABLE_TABLE_NAME" \
             --token "$AIRTABLE_PAT" \
-            --csv "Canvas_Enrollment_Courses.csv" \
+            --csv "Students_AllInOne.csv" \
             --unique-field "Enrollment Course Key"
