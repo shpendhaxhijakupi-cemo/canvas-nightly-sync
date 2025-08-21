@@ -1,9 +1,9 @@
-name: Nightly Canvas Export (Filtered)
+name: Nightly Canvas Export (Courses)
 
 on:
-  workflow_dispatch:        # enables the "Run workflow" button
+  workflow_dispatch:        # manual runs
   schedule:
-    - cron: '0 2 * * *'     # daily at 02:00 UTC
+    - cron: "0 2 * * *"     # daily at 02:00 UTC
 
 permissions:
   contents: read
@@ -19,27 +19,163 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install requests
 
-      - name: Run Canvas Export (filtered)
+      # Build the per-course CSV we need (independent of any summary CSV)
+      - name: Build per-course CSV for Airtable
         env:
-          API_URL: ${{ secrets.CANVAS_API_URL }}
-          API_KEY: ${{ secrets.CANVAS_API_KEY }}
-          IDS:     ${{ secrets.INCLUDE_CANVAS_IDS }}   # optional: "796,797,884"
+          API_URL:  ${{ secrets.CANVAS_API_URL }}
+          API_KEY:  ${{ secrets.CANVAS_API_KEY }}
+          IDS:      ${{ secrets.INCLUDE_CANVAS_IDS }}   # optional: "796,797,884"
         run: |
-          echo "Filtering to Canvas IDs (if provided): ${IDS:-<none>}"
-          python canvas_export_enrollment_b2c_final_2.py \
-            --api-url "$API_URL" \
-            --api-key "$API_KEY" \
-            --account-id self \
-            --out "Canvas_Enrollment_Courses.csv" \
-            --include-assignments \
-            ${IDS:+--include-canvas-ids "$IDS"}
+          python - <<'PY'
+          import csv, os, time, sys
+          from datetime import datetime
+          import requests
+
+          API_URL = os.environ["API_URL"].rstrip("/")
+          API_KEY = os.environ["API_KEY"]
+          IDS     = [s.strip() for s in (os.environ.get("IDS") or "").split(",") if s.strip()]
+          HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+          PER_PAGE = 100
+          START_MONTH = 8  # school year begins in August; adjust if needed
+
+          def iso(dt):
+              return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
+
+          def school_year(dt):
+              if not dt: return ""
+              y = dt.year
+              return f"{y-1}-{y}" if dt.month < START_MONTH else f"{y}-{y+1}"
+
+          def paged(url, params=None):
+              params = dict(params or {})
+              while True:
+                  r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+                  if r.status_code in (429,500,502,503,504):
+                      time.sleep(1); continue
+                  r.raise_for_status()
+                  data = r.json()
+                  if isinstance(data, list):
+                      for x in data: yield x
+                  else:
+                      yield data
+                  link = r.headers.get("Link","")
+                  nxt = None
+                  for part in link.split(","):
+                      if 'rel="next"' in part:
+                          nxt = part[part.find("<")+1: part.find(">")]
+                          break
+                  if not nxt: break
+                  url, params = nxt, None
+
+          out = "Canvas_Enrollment_Courses.csv"
+          with open(out, "w", newline="", encoding="utf-8") as f:
+              w = csv.writer(f)
+              w.writerow([
+                  "Enrollment Course Key","Enrollment Key","Student Canvas ID","Student Name",
+                  "School Year","Course ID","Course Code","Course Name",
+                  "Course Start Date","Course End Date","Assigned Teachers",
+                  "Current Score","Final Score","Passed?",
+                  "Total Assignments","Completed Assignments","Unsubmitted Assignments","% Completed"
+              ])
+
+              # Build the working student list
+              student_ids = IDS[:]
+              if not student_ids:
+                  # WARNING: this fetches *all* students; filter with INCLUDE_CANVAS_IDS for large accounts
+                  for u in paged(f"{API_URL}/accounts/self/users",
+                                 {"enrollment_type[]":"student","per_page":PER_PAGE}):
+                      if u.get("id"): student_ids.append(str(u["id"]))
+
+              for uid in student_ids:
+                  try:
+                      # name/profile
+                      prof = requests.get(f"{API_URL}/users/{uid}/profile", headers=HEADERS, timeout=30)
+                      name = (prof.json().get("name") or f"User {uid}") if prof.ok else f"User {uid}"
+
+                      # student enrollments with grades
+                      for enr in paged(f"{API_URL}/users/{uid}/enrollments",
+                                       {"type[]":"StudentEnrollment","include[]":"grades","per_page":PER_PAGE}):
+                          cid = enr.get("course_id")
+                          if not cid: continue
+                          grades = enr.get("grades") or {}
+                          cur = grades.get("current_score")
+                          fin = grades.get("final_score")
+
+                          # course details
+                          c = requests.get(f"{API_URL}/courses/{cid}", headers=HEADERS, timeout=60)
+                          course = c.json() if c.ok else {}
+                          cstart = iso(course.get("start_at")) or iso(enr.get("start_at"))
+                          cend   = iso(course.get("end_at")) or iso(enr.get("end_at"))
+                          sy     = school_year(cstart or iso(enr.get("created_at")))
+
+                          # teachers
+                          tnames = []
+                          for t in paged(f"{API_URL}/courses/{cid}/enrollments",
+                                         {"type[]":"TeacherEnrollment","per_page":PER_PAGE}):
+                              u = t.get("user") or {}
+                              nm = u.get("name") or u.get("sortable_name")
+                              if nm: tnames.append(nm)
+                          teachers = ", ".join(sorted(set(tnames)))
+
+                          # basic pass/fail (60 threshold)
+                          passed = ""
+                          try:
+                              if fin is not None:
+                                  passed = "Yes" if float(fin) >= 60.0 else "No"
+                          except Exception:
+                              passed = ""
+
+                          # basic assignment stats (skip NPS)
+                          total = comp = unsubmitted = 0
+                          # assignments
+                          for a in paged(f"{API_URL}/courses/{cid}/assignments", None):
+                              if not a.get("published"): 
+                                  continue
+                              if a.get("name") == "End of Unit Feedback (Mandatory)":
+                                  continue
+                              total += 1
+                              # submission
+                              s = requests.get(f"{API_URL}/courses/{cid}/assignments/{a['id']}/submissions/{uid}",
+                                               headers=HEADERS, timeout=30)
+                              if s.ok:
+                                  sub = s.json()
+                                  state = sub.get("workflow_state") or "unsubmitted"
+                                  if sub.get("excused"):
+                                      comp += 1
+                                  elif state in ("graded","submitted") and (sub.get("grade") not in (None,"-","")):
+                                      comp += 1
+                                  else:
+                                      unsubmitted += 1
+                              else:
+                                  unsubmitted += 1
+                          pct = f"{(comp/total*100):.2f}%" if total else "0.00%"
+
+                          enr_key = f"{uid}-{sy}"
+                          key     = f"{uid}-{sy}-{cid}"
+
+                          w.writerow([
+                              key, enr_key, uid, name,
+                              sy, cid, course.get("course_code") or "", course.get("name") or "",
+                              cstart.isoformat() if cstart else "",
+                              cend.isoformat() if cend else "",
+                              teachers, cur if cur is not None else "",
+                              fin if fin is not None else "", passed,
+                              total, comp, unsubmitted, pct
+                          ])
+                  except Exception as e:
+                      print(f"[warn] failed student {uid}: {e}", file=sys.stderr)
+                      continue
+
+          print("[ok] Wrote Canvas_Enrollment_Courses.csv")
+          PY
 
       - name: Upload CSVs (optional)
         uses: actions/upload-artifact@v4
@@ -51,8 +187,9 @@ jobs:
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}  # e.g. B2C Courses Enrollment
+          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}  # set to: B2C Courses Enrollment
         run: |
+          # IMPORTANT: School Year must be a text field in Airtable (e.g., "2024-2025")
           python airtable_upsert.py \
             --base "$AIRTABLE_BASE_ID" \
             --table "$AIRTABLE_TABLE_NAME" \
