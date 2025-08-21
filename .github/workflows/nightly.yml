@@ -22,104 +22,152 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # requests is used by the inline exporter below
+          pip install requests
 
-      # 1) Run YOUR exporter with a target filename we expect to upsert
-      - name: Run Canvas Export (filtered, courses intent)
+      # (Optional) still run your summary exporter if you want the student sheet too
+      - name: Run your summary exporter (optional)
+        continue-on-error: true
         env:
-          API_URL: ${{ secrets.CANVAS_API_URL }}
-          API_KEY: ${{ secrets.CANVAS_API_KEY }}
-          IDS:     ${{ secrets.INCLUDE_CANVAS_IDS }}   # e.g. "796,797,884"
+          API_URL:  ${{ secrets.CANVAS_API_URL }}
+          API_KEY:  ${{ secrets.CANVAS_API_KEY }}
+          IDS:      ${{ secrets.INCLUDE_CANVAS_IDS }}
         run: |
-          # Write to a predictable name
           python canvas_export_enrollment_b2c_final_2.py \
             --api-url "$API_URL" \
             --api-key "$API_KEY" \
             --account-id self \
-            --out "Canvas_Enrollment_Courses.csv" \
+            --out "Students_AllInOne.csv" \
             --include-assignments \
-            --include-canvas-ids "$IDS" || true
+            --include-canvas-ids "$IDS"
 
-      # 2) Discover any CSV your script produced and point to the courses CSV
-      - name: Discover CSV outputs
-        id: discover
-        shell: bash
+      # === Generate the PER-COURSE CSV directly from Canvas ===
+      - name: Build per-course CSV for Airtable
+        env:
+          API_URL:  ${{ secrets.CANVAS_API_URL }}
+          API_KEY:  ${{ secrets.CANVAS_API_KEY }}
+          IDS:      ${{ secrets.INCLUDE_CANVAS_IDS }}   # e.g. "796,797,884"
         run: |
-          echo "== ls root =="
-          ls -la || true
-          echo "== root CSVs =="
-          ls -1 *.csv 2>/dev/null || true
+          python - <<'PY'
+          import csv, os, sys, time
+          from datetime import datetime
+          import requests
 
-          COURSES=""
-          # if the expected name exists, use it
-          if [ -f "Canvas_Enrollment_Courses.csv" ]; then
-            COURSES="Canvas_Enrollment_Courses.csv"
-          fi
+          API_URL = os.environ["API_URL"].rstrip("/")
+          API_KEY = os.environ["API_KEY"]
+          IDS = [s.strip() for s in os.environ.get("IDS","").split(",") if s.strip()]
+          HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+          PER_PAGE = 100
+          START_MONTH = 8  # school year start (Aug)
 
-          # try common patterns
-          if [ -z "$COURSES" ]; then
-            COURSES=$(ls -1 *Enrollment_Courses*.csv 2>/dev/null | head -n1 || true)
-          fi
+          def iso(dt):
+              return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
 
-          # final fallback: first CSV in root
-          if [ -z "$COURSES" ]; then
-            COURSES=$(ls -1 *.csv 2>/dev/null | head -n1 || true)
-          fi
+          def school_year(dt):
+              if not dt: return ""
+              y = dt.year
+              return f"{y-1}-{y}" if dt.month < START_MONTH else f"{y}-{y+1}"
 
-          echo "Detected courses CSV: ${COURSES:-<none>}"
-          echo "COURSES_CSV=$COURSES" >> "$GITHUB_ENV"
+          def paged(url, params=None):
+              params = dict(params or {})
+              while True:
+                  r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+                  if r.status_code in (429,500,502,503,504):
+                      time.sleep(1); continue
+                  r.raise_for_status()
+                  data = r.json()
+                  if isinstance(data, list):
+                      for x in data: yield x
+                  else:
+                      yield data
+                  link = r.headers.get("Link","")
+                  nxt = None
+                  for part in link.split(","):
+                      if 'rel="next"' in part:
+                          nxt = part[part.find("<")+1: part.find(">")]
+                          break
+                  if not nxt: break
+                  url, params = nxt, None
 
-          if [ -z "$COURSES" ]; then
-            echo "::error::No CSV produced by the export step. Check exporter logs."
-            exit 1
-          fi
+          # Write output
+          out = "Canvas_Enrollment_Courses.csv"
+          with open(out, "w", newline="", encoding="utf-8") as f:
+              w = csv.writer(f)
+              w.writerow([
+                  "Enrollment Course Key","Enrollment Key","Student Canvas ID","Student Name",
+                  "School Year","Course ID","Course Code","Course Name",
+                  "Course Start Date","Course End Date","Assigned Teachers",
+                  "Current Score","Final Score","Passed?"
+              ])
 
-      # 3) If the CSV is per-course but missing the upsert key, add it
-      - name: Ensure Enrollment Course Key column exists
-        shell: python
-        run: |
-          import csv, sys
-          from pathlib import Path
-          p = Path("${{ env.COURSES_CSV }}")
-          if not p.exists():
-              print(f"::error::CSV not found: {p}")
-              sys.exit(1)
+              # iterate students
+              for uid in IDS:
+                  try:
+                      # get basic name
+                      prof = requests.get(f"{API_URL}/users/{uid}/profile", headers=HEADERS, timeout=30)
+                      if prof.ok:
+                          name = (prof.json().get("name") or "").strip()
+                      else:
+                          name = f"User {uid}"
 
-          # Read headers to decide whether we can synthesize the key
-          with p.open(newline="", encoding="utf-8") as f:
-              rdr = csv.DictReader(f)
-              rows = list(rdr)
-              headers = rdr.fieldnames or []
-          print("[info] CSV headers:", headers)
+                      # enrollments with grades
+                      for enr in paged(f"{API_URL}/users/{uid}/enrollments",
+                                       {"type[]":"StudentEnrollment","include[]":"grades","per_page":PER_PAGE}):
+                          cid = enr.get("course_id")
+                          if not cid: continue
+                          grades = enr.get("grades") or {}
+                          cur = grades.get("current_score")
+                          fin = grades.get("final_score")
 
-          need = {"Enrollment Course Key"}
-          have_key = "Enrollment Course Key" in headers and any((r.get("Enrollment Course Key") or "").strip() for r in rows)
-          if have_key:
-              print("[ok] 'Enrollment Course Key' already present.")
-              sys.exit(0)
+                          # course info
+                          c = requests.get(f"{API_URL}/courses/{cid}", headers=HEADERS, timeout=60)
+                          if not c.ok: 
+                              course = {}
+                          else:
+                              course = c.json()
 
-          required = {"Student Canvas ID","School Year","Course ID"}
-          if not required.issubset(set(headers)):
-              # this looks like a *summary* CSV (not per-course) — fail clearly
-              print("::error::CSV does not contain per-course columns needed to build 'Enrollment Course Key'.")
-              print("::error::Required headers missing. Need all of:", required)
-              sys.exit(1)
+                          cstart = iso(course.get("start_at")) or iso(enr.get("start_at"))
+                          cend   = iso(course.get("end_at")) or iso(enr.get("end_at"))
+                          sy = school_year(cstart or iso(enr.get("created_at")))
 
-          # Add/synthesize the key
-          for r in rows:
-              sid = (r.get("Student Canvas ID") or "").strip()
-              yr  = (r.get("School Year") or "").strip()
-              cid = (r.get("Course ID") or "").strip()
-              r["Enrollment Course Key"] = f"{sid}-{yr}-{cid}" if sid and yr and cid else ""
+                          # teachers
+                          tnames = []
+                          for t in paged(f"{API_URL}/courses/{cid}/enrollments",
+                                         {"type[]":"TeacherEnrollment","per_page":PER_PAGE}):
+                              u = t.get("user") or {}
+                              nm = u.get("name") or u.get("sortable_name")
+                              if nm: tnames.append(nm)
+                          tnames = sorted(set(tnames))
+                          teachers = ", ".join(tnames)
 
-          out_headers = headers + ([ "Enrollment Course Key" ] if "Enrollment Course Key" not in headers else [])
-          with p.open("w", newline="", encoding="utf-8") as f:
-              w = csv.DictWriter(f, fieldnames=out_headers)
-              w.writeheader()
-              w.writerows(rows)
+                          key = f"{uid}-{sy}-{cid}"
+                          enr_key = f"{uid}-{sy}"
 
-          print("[ok] Synthesized 'Enrollment Course Key'.")
+                          passed = ""
+                          try:
+                              if fin is not None:
+                                  passed = "Yes" if float(fin) >= 60.0 else "No"
+                          except Exception:
+                              passed = ""
 
-      # 4) Keep CSVs as artifacts for auditing
+                          w.writerow([
+                              key, enr_key, uid, name, sy, cid,
+                              course.get("course_code") or "",
+                              course.get("name") or "",
+                              cstart.isoformat() if cstart else "",
+                              cend.isoformat() if cend else "",
+                              teachers,
+                              cur if cur is not None else "",
+                              fin if fin is not None else "",
+                              passed
+                          ])
+                  except Exception as e:
+                      print(f"[warn] failed student {uid}: {e}", file=sys.stderr)
+                      continue
+
+          print("[ok] Wrote Canvas_Enrollment_Courses.csv")
+          PY
+
       - name: Upload CSVs as artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -127,7 +175,6 @@ jobs:
           path: |
             *.csv
 
-      # 5) Upsert into Airtable (B2C Courses Enrollment)
       - name: Upsert Enrollment Courses → Airtable
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
@@ -138,6 +185,6 @@ jobs:
             --base "$AIRTABLE_BASE_ID" \
             --table "$AIRTABLE_TABLE_NAME" \
             --token "$AIRTABLE_PAT" \
-            --csv "$COURSES_CSV" \
+            --csv "Canvas_Enrollment_Courses.csv" \
             --unique-field "Enrollment Course Key" \
             --typecast
