@@ -1,17 +1,20 @@
-name: Nightly Canvas Export (Filtered)
+name: Nightly Canvas Export (Courses Only)
 
 on:
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 2 * * *"   # daily at 02:00 UTC
   workflow_dispatch:
 
 jobs:
   run-export:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -20,37 +23,121 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Export per-course enrollments (filtered)
+      # 1) Run YOUR exporter with a target filename we expect to upsert
+      - name: Run Canvas Export (filtered, courses intent)
         env:
-          API_URL:  ${{ secrets.CANVAS_API_URL }}
-          API_KEY:  ${{ secrets.CANVAS_API_KEY }}
-          IDS:      ${{ secrets.INCLUDE_CANVAS_IDS }}   # "796,797,884"
+          API_URL: ${{ secrets.CANVAS_API_URL }}
+          API_KEY: ${{ secrets.CANVAS_API_KEY }}
+          IDS:     ${{ secrets.INCLUDE_CANVAS_IDS }}   # e.g. "796,797,884"
         run: |
-          python canvas_export_enrollments.py \
+          # Write to a predictable name
+          python canvas_export_enrollment_b2c_final_2.py \
             --api-url "$API_URL" \
             --api-key "$API_KEY" \
             --account-id self \
-            --out-prefix "Canvas" \
-            --include-canvas-ids "$IDS"
+            --out "Canvas_Enrollment_Courses.csv" \
+            --include-assignments \
+            --include-canvas-ids "$IDS" || true
 
+      # 2) Discover any CSV your script produced and point to the courses CSV
+      - name: Discover CSV outputs
+        id: discover
+        shell: bash
+        run: |
+          echo "== ls root =="
+          ls -la || true
+          echo "== root CSVs =="
+          ls -1 *.csv 2>/dev/null || true
+
+          COURSES=""
+          # if the expected name exists, use it
+          if [ -f "Canvas_Enrollment_Courses.csv" ]; then
+            COURSES="Canvas_Enrollment_Courses.csv"
+          fi
+
+          # try common patterns
+          if [ -z "$COURSES" ]; then
+            COURSES=$(ls -1 *Enrollment_Courses*.csv 2>/dev/null | head -n1 || true)
+          fi
+
+          # final fallback: first CSV in root
+          if [ -z "$COURSES" ]; then
+            COURSES=$(ls -1 *.csv 2>/dev/null | head -n1 || true)
+          fi
+
+          echo "Detected courses CSV: ${COURSES:-<none>}"
+          echo "COURSES_CSV=$COURSES" >> "$GITHUB_ENV"
+
+          if [ -z "$COURSES" ]; then
+            echo "::error::No CSV produced by the export step. Check exporter logs."
+            exit 1
+          fi
+
+      # 3) If the CSV is per-course but missing the upsert key, add it
+      - name: Ensure Enrollment Course Key column exists
+        shell: python
+        run: |
+          import csv, sys
+          from pathlib import Path
+          p = Path("${{ env.COURSES_CSV }}")
+          if not p.exists():
+              print(f"::error::CSV not found: {p}")
+              sys.exit(1)
+
+          # Read headers to decide whether we can synthesize the key
+          with p.open(newline="", encoding="utf-8") as f:
+              rdr = csv.DictReader(f)
+              rows = list(rdr)
+              headers = rdr.fieldnames or []
+          print("[info] CSV headers:", headers)
+
+          need = {"Enrollment Course Key"}
+          have_key = "Enrollment Course Key" in headers and any((r.get("Enrollment Course Key") or "").strip() for r in rows)
+          if have_key:
+              print("[ok] 'Enrollment Course Key' already present.")
+              sys.exit(0)
+
+          required = {"Student Canvas ID","School Year","Course ID"}
+          if not required.issubset(set(headers)):
+              # this looks like a *summary* CSV (not per-course) — fail clearly
+              print("::error::CSV does not contain per-course columns needed to build 'Enrollment Course Key'.")
+              print("::error::Required headers missing. Need all of:", required)
+              sys.exit(1)
+
+          # Add/synthesize the key
+          for r in rows:
+              sid = (r.get("Student Canvas ID") or "").strip()
+              yr  = (r.get("School Year") or "").strip()
+              cid = (r.get("Course ID") or "").strip()
+              r["Enrollment Course Key"] = f"{sid}-{yr}-{cid}" if sid and yr and cid else ""
+
+          out_headers = headers + ([ "Enrollment Course Key" ] if "Enrollment Course Key" not in headers else [])
+          with p.open("w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=out_headers)
+              w.writeheader()
+              w.writerows(rows)
+
+          print("[ok] Synthesized 'Enrollment Course Key'.")
+
+      # 4) Keep CSVs as artifacts for auditing
       - name: Upload CSVs as artifacts
         uses: actions/upload-artifact@v4
         with:
           name: canvas-csvs
           path: |
-            Canvas_Enrollments.csv
-            Canvas_Enrollment_Courses.csv
+            *.csv
 
+      # 5) Upsert into Airtable (B2C Courses Enrollment)
       - name: Upsert Enrollment Courses → Airtable
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
+          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}  # "B2C Courses Enrollment"
         run: |
           python airtable_upsert.py \
             --base "$AIRTABLE_BASE_ID" \
             --table "$AIRTABLE_TABLE_NAME" \
             --token "$AIRTABLE_PAT" \
-            --csv "Canvas_Enrollment_Courses.csv" \
+            --csv "$COURSES_CSV" \
             --unique-field "Enrollment Course Key" \
             --typecast
