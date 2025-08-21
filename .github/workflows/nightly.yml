@@ -1,9 +1,9 @@
-name: Nightly Canvas Export
+name: Nightly Canvas Export (Filtered)
 
 on:
   schedule:
-    - cron: "0 2 * * *"  # Every day at 02:00 UTC
-  workflow_dispatch:      # Allow manual run from GitHub
+    - cron: "0 2 * * *"   # runs daily at 02:00 UTC
+  workflow_dispatch:
 
 jobs:
   run-export:
@@ -11,38 +11,106 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run Canvas Export
-        env:
-          API_URL: ${{ secrets.CANVAS_API_URL }}
-          API_KEY: ${{ secrets.CANVAS_API_KEY }}
         run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ===== Export from Canvas (filtered to the IDs in INCLUDE_CANVAS_IDS secret) =====
+      - name: Run Canvas Export (filtered)
+        env:
+          API_URL:  ${{ secrets.CANVAS_API_URL }}
+          API_KEY:  ${{ secrets.CANVAS_API_KEY }}
+          IDS:      ${{ secrets.INCLUDE_CANVAS_IDS }}   # e.g. "796,797,884"
+        run: |
+          # Use a generic name; your script may write 1 file or more.
+          # If your script expects a filename, keep --out. If it expects a prefix, it will still work.
           python canvas_export_enrollment_b2c_final_2.py \
             --api-url "$API_URL" \
             --api-key "$API_KEY" \
             --account-id self \
-            --out "Canvas" \
-            --include-assignments
+            --out "Canvas_Enrollment_Courses.csv" \
+            --include-assignments \
+            --include-canvas-ids "$IDS" || true
 
+      # ===== Discover the actual CSV path(s) produced by the script =====
+      - name: Discover CSV outputs
+        id: discover
+        shell: bash
+        run: |
+          echo "== Workspace listing =="
+          ls -la
+          echo
+
+          echo "== Any CSVs in root =="
+          ls -1 *.csv 2>/dev/null || true
+          echo
+
+          # Try canonical name first (root)
+          COURSES=""
+          if [ -f "Canvas_Enrollment_Courses.csv" ]; then
+            COURSES="Canvas_Enrollment_Courses.csv"
+          fi
+
+          # If not found, try patterns in root
+          if [ -z "$COURSES" ]; then
+            COURSES=$(ls -1 *Enrollment_Courses*.csv 2>/dev/null | head -n1 || true)
+          fi
+
+          # If still not found, look in a "Canvas" directory (some scripts write there)
+          if [ -z "$COURSES" ] && [ -d "Canvas" ]; then
+            echo "== CSVs in Canvas/ directory =="
+            ls -1 Canvas/*.csv 2>/dev/null || true
+            COURSES=$(ls -1 Canvas/*Enrollment_Courses*.csv 2>/dev/null | head -n1 || true)
+            # fallback: first CSV in Canvas/
+            if [ -z "$COURSES" ]; then
+              COURSES=$(ls -1 Canvas/*.csv 2>/dev/null | head -n1 || true)
+            fi
+          fi
+
+          # Final fallback: any CSV in root
+          if [ -z "$COURSES" ]; then
+            COURSES=$(ls -1 *.csv 2>/dev/null | head -n1 || true)
+          fi
+
+          echo "Detected courses CSV: ${COURSES:-<none>}"
+          echo "COURSES_CSV=$COURSES" >> "$GITHUB_ENV"
+
+          # Fail cleanly if nothing detected
+          if [ -z "$COURSES" ]; then
+            echo "ERROR: No CSV file was produced by the export step."
+            echo "Check the 'Run Canvas Export' logs to see what your script wrote."
+            exit 1
+          fi
+
+      # Keep all CSVs for auditing
+      - name: Upload CSVs as artifacts (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-csvs
+          path: |
+            *.csv
+            Canvas/*.csv
+
+      # ===== Upsert detected CSV into Airtable =====
       - name: Upsert Enrollment Courses → Airtable
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
         run: |
+          echo "Using courses CSV: $COURSES_CSV"
           python airtable_upsert.py \
             --base "$AIRTABLE_BASE_ID" \
             --table "$AIRTABLE_TABLE_NAME" \
             --token "$AIRTABLE_PAT" \
-            --csv "Canvas_Enrollment_Courses.csv" \
+            --csv "$COURSES_CSV" \
             --unique-field "Enrollment Course Key" \
             --typecast
