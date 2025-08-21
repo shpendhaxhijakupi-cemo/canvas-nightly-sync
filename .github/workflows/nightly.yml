@@ -1,139 +1,62 @@
-#!/usr/bin/env python3
-import argparse, csv, os, sys, time, json
-import requests
-from typing import List, Dict
+name: Nightly Canvas Export (Filtered)
 
-API_BASE = "https://api.airtable.com/v0"
-BATCH_SIZE = 10
-RETRY_STATUSES = {429, 500, 502, 503, 504}
+on:
+  workflow_dispatch:        # enables the "Run workflow" button
+  schedule:
+    - cron: '0 2 * * *'     # daily at 02:00 UTC
 
-def err(msg: str):
-    print(f"[fatal] {msg}", file=sys.stderr)
-    sys.exit(1)
+permissions:
+  contents: read
 
-def load_csv(path: str) -> List[Dict]:
-    if not os.path.exists(path):
-        err(f"CSV not found: {path}")
-    with open(path, newline="", encoding="utf-8") as f:
-        rdr = csv.DictReader(f)
-        rows = list(rdr)
-        headers = rdr.fieldnames or []
-    print(f"[info] CSV headers: {headers}")
-    return rows
+jobs:
+  run-export:
+    runs-on: ubuntu-24.04
 
-def synthesize_key(rows: List[Dict], target_field: str) -> bool:
-    """Return True if synthesized; False if not possible."""
-    need = ["Student Canvas ID", "School Year", "Course ID"]
-    if not rows:
-        return False
-    if not all(k in rows[0] for k in need):
-        return False
-    for r in rows:
-        sid = (r.get("Student Canvas ID") or "").strip()
-        sy  = (r.get("School Year") or "").strip()
-        cid = (r.get("Course ID") or "").strip()
-        r[target_field] = f"{sid}-{sy}-{cid}" if sid and sy and cid else ""
-    print(f"[info] Synthesized '{target_field}' from {need}.")
-    return True
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-def normalize_row(r: Dict) -> Dict:
-    """Light cleanup (strip percent symbol)."""
-    out = {}
-    for k, v in r.items():
-        if v is None:
-            continue
-        if isinstance(v, str):
-            v = v.strip()
-            if k == "% Completed" and v.endswith("%"):
-                try:
-                    v = float(v[:-1])
-                except Exception:
-                    pass
-        out[k] = v
-    return out
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-def retryable_request(method: str, url: str, headers: Dict, payload: Dict):
-    delay = 1.0
-    while True:
-        resp = requests.request(method, url, headers=headers, json=payload, timeout=60)
-        if resp.status_code in RETRY_STATUSES:
-            ra = resp.headers.get("Retry-After")
-            if ra:
-                try: delay = max(delay, float(ra))
-                except Exception: pass
-            print(f"[warn] {resp.status_code} from Airtable; retrying in {delay:.1f}s")
-            time.sleep(delay)
-            delay = min(delay * 2, 30.0)
-            continue
-        return resp
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-def upsert(base: str, table: str, token: str, rows: List[Dict], unique_field: str, typecast: bool):
-    url = f"{API_BASE}/{base}/{requests.utils.quote(table, safe='')}"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    total = len(rows)
-    done = 0
-    errors = 0
-    for i in range(0, total, BATCH_SIZE):
-        chunk = rows[i:i+BATCH_SIZE]
-        payload = {
-            "performUpsert": {"fieldsToMergeOn": [unique_field]},
-            "typecast": bool(typecast),
-            "records": [{"fields": normalize_row(r)} for r in chunk],
-        }
-        resp = retryable_request("PATCH", url, headers, payload)
-        if not resp.ok:
-            errors += 1
-            print(f"Error uploading batch {i//BATCH_SIZE + 1}: {resp.status_code} {resp.text}")
-        else:
-            done += len(chunk)
-    print(f"[done] Upserted {done}/{total} rows. Batches with errors: {errors}")
-    if errors:
-        sys.exit(1)
+      - name: Run Canvas Export (filtered)
+        env:
+          API_URL: ${{ secrets.CANVAS_API_URL }}
+          API_KEY: ${{ secrets.CANVAS_API_KEY }}
+          IDS:     ${{ secrets.INCLUDE_CANVAS_IDS }}   # optional: "796,797,884"
+        run: |
+          echo "Filtering to Canvas IDs (if provided): ${IDS:-<none>}"
+          python canvas_export_enrollment_b2c_final_2.py \
+            --api-url "$API_URL" \
+            --api-key "$API_KEY" \
+            --account-id self \
+            --out "Canvas_Enrollment_Courses.csv" \
+            --include-assignments \
+            ${IDS:+--include-canvas-ids "$IDS"}
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--base", required=True)
-    p.add_argument("--table", required=True)
-    p.add_argument("--token", required=True)
-    p.add_argument("--csv", required=True)
-    p.add_argument("--unique-field", default="Enrollment Course Key")
-    p.add_argument("--typecast", action="store_true")
-    args = p.parse_args()
+      - name: Upload CSVs (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-csvs
+          path: "*.csv"
 
-    rows = load_csv(args.csv)
-    if not rows:
-        print("[info] CSV empty; nothing to do.")
-        return
-
-    # Ensure unique field exists; try to synthesize if missing
-    has_key = args.unique_field in rows[0]
-    if not has_key:
-        # If it's a SUMMARY CSV (no per-course fields), fail clearly
-        summary_cols = {"Student First Name","Student Last Name","Course Names","Total courses enrolled"}
-        course_cols  = {"Student Canvas ID","School Year","Course ID"}
-        cols = set(rows[0].keys())
-        if course_cols.issubset(cols):
-            if not synthesize_key(rows, args.unique_field):
-                err(f"Could not synthesize '{args.unique_field}'.")
-        elif summary_cols & cols:
-            print("CSV columns:", list(cols))
-            err(
-                f"Unique field '{args.unique_field}' not found and cannot synthesize.\n"
-                f"Either add '{args.unique_field}' to your CSV OR use a per-course CSV with "
-                f"columns 'Student Canvas ID', 'School Year', and 'Course ID'."
-            )
-        else:
-            print("CSV columns:", list(cols))
-            err(
-                f"Unique field '{args.unique_field}' not found. Provide it, or include the fields "
-                f"'Student Canvas ID', 'School Year', and 'Course ID' so it can be synthesized."
-            )
-
-    # Final warning about School Year type in Airtable
-    if "School Year" in rows[0]:
-        print("[hint] Ensure 'School Year' in Airtable is a *text* field (label like '2024-2025').")
-
-    upsert(args.base, args.table, args.token, rows, args.unique_field, args.typecast)
-
-if __name__ == "__main__":
-    main()
+      - name: Upsert Courses → Airtable
+        env:
+          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}  # e.g. B2C Courses Enrollment
+        run: |
+          python airtable_upsert.py \
+            --base "$AIRTABLE_BASE_ID" \
+            --table "$AIRTABLE_TABLE_NAME" \
+            --token "$AIRTABLE_PAT" \
+            --csv "Canvas_Enrollment_Courses.csv" \
+            --unique-field "Enrollment Course Key" \
+            --typecast
