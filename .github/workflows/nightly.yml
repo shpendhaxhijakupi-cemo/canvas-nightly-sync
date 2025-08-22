@@ -27,6 +27,8 @@ jobs:
             table: "Rock Christian Courses Enrollment"
           - key: GANEVAS
             table: "Ganevas Courses Enrollment"
+          - key: NHCC
+            table: "NHCC Courses Enrollment"
 
     steps:
       - name: Checkout
@@ -54,6 +56,7 @@ jobs:
           IDS_1211:           ${{ secrets.IDS_1211 }}
           IDS_ROCKCHRISTIAN:  ${{ secrets.IDS_ROCKCHRISTIAN }}
           IDS_GANEVAS:        ${{ secrets.IDS_GANEVAS }}
+          IDS_NHCC:           ${{ secrets.IDS_NHCC }}
         run: |
           case "${{ matrix.key }}" in
             B2C)             echo "ids=$INCLUDE_CANVAS_IDS"  >> $GITHUB_OUTPUT ;;
@@ -62,6 +65,7 @@ jobs:
             ONE_TWO_ONE_ONE) echo "ids=$IDS_1211"            >> $GITHUB_OUTPUT ;;
             ROCKCHRISTIAN)   echo "ids=$IDS_ROCKCHRISTIAN"   >> $GITHUB_OUTPUT ;;
             GANEVAS)         echo "ids=$IDS_GANEVAS"         >> $GITHUB_OUTPUT ;;
+            NHCC)            echo "ids=$IDS_NHCC"            >> $GITHUB_OUTPUT ;;
             *) echo "Unknown cohort key: ${{ matrix.key }}"; exit 1 ;;
           esac
 
