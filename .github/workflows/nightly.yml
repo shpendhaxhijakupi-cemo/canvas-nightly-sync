@@ -43,7 +43,7 @@ jobs:
           pip install -r requirements.txt
           pip install requests
 
-      # Map the cohort key to the correct secret of Canvas IDs
+      # Map cohort -> correct secret of Canvas IDs
       - name: Resolve Canvas IDs for cohort
         id: resolve_ids
         shell: bash
@@ -51,7 +51,7 @@ jobs:
           INCLUDE_CANVAS_IDS: ${{ secrets.INCLUDE_CANVAS_IDS }}
           IDS_SOUTHLANDS:     ${{ secrets.IDS_SOUTHLANDS }}
           IDS_PHOENIX:        ${{ secrets.IDS_PHOENIX }}
-          IDS_1211:          ${{ secrets.IDS_1211 }}
+          IDS_1211:           ${{ secrets.IDS_1211 }}
           IDS_ROCKCHRISTIAN:  ${{ secrets.IDS_ROCKCHRISTIAN }}
           IDS_GANEVAS:        ${{ secrets.IDS_GANEVAS }}
         run: |
@@ -81,7 +81,7 @@ jobs:
           IDS     = [s.strip() for s in (os.environ.get("IDS") or "").split(",") if s.strip()]
           HEADERS = {"Authorization": f"Bearer {API_KEY}"}
           PER_PAGE = 100
-          START_MONTH = 8  # school year starts in August; adjust if needed
+          START_MONTH = 8  # school year starts in August
 
           def iso(dt): return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
           def school_year(dt):
@@ -157,13 +157,13 @@ jobs:
                               if nm: tnames.append(nm)
                           teachers = ", ".join(sorted(set(tnames)))
 
-                          # pass/fail (60)
+                          # pass/fail
                           passed = ""
                           try:
                               if fin is not None: passed = "Yes" if float(fin) >= 60.0 else "No"
                           except Exception: passed = ""
 
-                          # assignments (exclude NPS form)
+                          # assignments (exclude NPS)
                           total = comp = unsubmitted = 0
                           for a in paged(f"{API_URL}/courses/{cid}/assignments"):
                               if not a.get("published"): continue
@@ -205,6 +205,23 @@ jobs:
           print("[ok] wrote Canvas_Enrollment_Courses.csv for cohort")
           PY
 
+      - name: Prepare CSV for upsert (strip Enrollment Key)
+        run: |
+          python - <<'PY'
+          import csv
+          src = "Canvas_Enrollment_Courses.csv"
+          dst = "Canvas_Enrollment_Courses_for_upsert.csv"
+          with open(src, newline="", encoding="utf-8") as f, open(dst, "w", newline="", encoding="utf-8") as g:
+              r = csv.DictReader(f)
+              fields = [h for h in r.fieldnames if h != "Enrollment Key"]
+              w = csv.DictWriter(g, fieldnames=fields)
+              w.writeheader()
+              for row in r:
+                  row.pop("Enrollment Key", None)
+                  w.writerow(row)
+          print("[ok] wrote", dst)
+          PY
+
       - name: Upload CSVs (optional)
         uses: actions/upload-artifact@v4
         with:
@@ -222,6 +239,6 @@ jobs:
             --base "$AIRTABLE_BASE_ID" \
             --table "$AIRTABLE_TABLE_NAME" \
             --token "$AIRTABLE_PAT" \
-            --csv "Canvas_Enrollment_Courses.csv" \
+            --csv "Canvas_Enrollment_Courses_for_upsert.csv" \
             --unique-field "Enrollment Course Key" \
             --typecast
