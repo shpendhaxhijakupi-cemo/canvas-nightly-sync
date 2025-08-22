@@ -3,7 +3,7 @@ name: Nightly Canvas Export (Cohorts)
 on:
   workflow_dispatch:        # manual runs
   schedule:
-    - cron: "0 5 * * *"     # daily at 02:00 UTC
+    - cron: "0 5 * * *"     # daily at 05:00 UTC
 
 permissions:
   contents: read
@@ -128,7 +128,7 @@ jobs:
                   print("[fatal] No Canvas IDs provided for this cohort.", file=sys.stderr)
                   sys.exit(1)
 
-              # case-insensitive substring filters
+              # Substring filters (case-insensitive)
               bad_patterns = ("NPS", "feedback", "survey")
 
               for uid in IDS:
@@ -171,7 +171,7 @@ jobs:
                           except Exception: passed = ""
 
                           # assignments:
-                          # - include all published
+                          # - include published
                           # - exclude exact "End of Unit Feedback (Mandatory)"
                           # - exclude names containing NPS|feedback|survey (case-insensitive)
                           total = comp = unsubmitted = 0
@@ -255,3 +255,67 @@ jobs:
             --csv "Canvas_Enrollment_Courses_for_upsert.csv" \
             --unique-field "Enrollment Course Key" \
             --typecast
+
+      - name: Mark missing records as inactive (soft-delete)
+        env:
+          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
+        run: |
+          python - <<'PY'
+          import os, csv, requests, time
+
+          BASE  = os.environ["AIRTABLE_BASE_ID"]
+          TABLE = os.environ["AIRTABLE_TABLE_NAME"]
+          TOKEN = os.environ["AIRTABLE_PAT"]
+          API   = f"https://api.airtable.com/v0/{BASE}/{requests.utils.quote(TABLE, safe='')}"
+          H     = {"Authorization": f"Bearer {TOKEN}"}
+
+          # Current keys from CSV
+          current_keys = set()
+          with open("Canvas_Enrollment_Courses_for_upsert.csv", newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+              k = (r.get("Enrollment Course Key") or "").strip()
+              if k: current_keys.add(k)
+
+          # Fetch all existing (id, key)
+          existing = []
+          offset = None
+          while True:
+            params = {"pageSize": 100}
+            if offset: params["offset"] = offset
+            r = requests.get(API, headers=H, params=params, timeout=60)
+            r.raise_for_status()
+            j = r.json()
+            for rec in j.get("records", []):
+              fields = rec.get("fields", {})
+              key = (fields.get("Enrollment Course Key") or "").strip()
+              if key:
+                existing.append((rec["id"], key))
+            offset = j.get("offset")
+            if not offset:
+              break
+
+          # Records to mark inactive
+          to_mark = [rid for rid, key in existing if key not in current_keys]
+          print(f"[info] Existing: {len(existing)}, Current: {len(current_keys)}, Inactive to mark: {len(to_mark)}")
+
+          for i in range(0, len(to_mark), 10):
+            batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
+            r = requests.patch(
+              API,
+              headers={**H, "Content-Type": "application/json"},
+              json={"records": batch, "typecast": True},
+              timeout=60
+            )
+            if r.status_code in (429, 500, 502, 503, 504):
+              time.sleep(2)
+              r = requests.patch(
+                API,
+                headers={**H, "Content-Type": "application/json"},
+                json={"records": batch, "typecast": True},
+                timeout=60
+              )
+            r.raise_for_status()
+          print("[ok] Soft-delete complete")
+          PY
