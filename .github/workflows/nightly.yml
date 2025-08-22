@@ -128,6 +128,9 @@ jobs:
                   print("[fatal] No Canvas IDs provided for this cohort.", file=sys.stderr)
                   sys.exit(1)
 
+              # case-insensitive substring filters
+              bad_patterns = ("NPS", "feedback", "survey")
+
               for uid in IDS:
                   try:
                       prof = requests.get(f"{API_URL}/users/{uid}/profile", headers=HEADERS, timeout=30)
@@ -167,11 +170,17 @@ jobs:
                               if fin is not None: passed = "Yes" if float(fin) >= 60.0 else "No"
                           except Exception: passed = ""
 
-                          # assignments (exclude NPS)
+                          # assignments:
+                          # - include all published
+                          # - exclude exact "End of Unit Feedback (Mandatory)"
+                          # - exclude names containing NPS|feedback|survey (case-insensitive)
                           total = comp = unsubmitted = 0
                           for a in paged(f"{API_URL}/courses/{cid}/assignments"):
+                              name_a = (a.get("name") or "")
                               if not a.get("published"): continue
-                              if a.get("name") == "End of Unit Feedback (Mandatory)": continue
+                              if name_a == "End of Unit Feedback (Mandatory)": continue
+                              if any(p.lower() in name_a.lower() for p in bad_patterns): continue
+
                               total += 1
                               s = requests.get(
                                 f"{API_URL}/courses/{cid}/assignments/{a['id']}/submissions/{uid}",
