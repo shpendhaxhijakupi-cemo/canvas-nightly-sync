@@ -1,4 +1,4 @@
-name: Nightly Canvas Export (Courses)
+name: Nightly Canvas Export (Cohorts)
 
 on:
   workflow_dispatch:        # manual runs
@@ -11,6 +11,22 @@ permissions:
 jobs:
   run-export:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: B2C
+            table: "B2C Courses Enrollment"
+          - key: SOUTHLANDS
+            table: "Southlands Courses Enrollment"
+          - key: PHOENIX
+            table: "Phoenix Christian Courses Enrollment"
+          - key: ONE_TWO_ONE_ONE
+            table: "1211 Courses Enrollment"
+          - key: ROCKCHRISTIAN
+            table: "Rock Christian Courses Enrollment"
+          - key: GANEVAS
+            table: "Ganevas Courses Enrollment"
 
     steps:
       - name: Checkout
@@ -27,12 +43,33 @@ jobs:
           pip install -r requirements.txt
           pip install requests
 
-      # Build the per-course CSV we need (independent of any summary CSV)
-      - name: Build per-course CSV for Airtable
+      # Map the cohort key to the correct secret of Canvas IDs
+      - name: Resolve Canvas IDs for cohort
+        id: resolve_ids
+        shell: bash
         env:
-          API_URL:  ${{ secrets.CANVAS_API_URL }}
-          API_KEY:  ${{ secrets.CANVAS_API_KEY }}
-          IDS:      ${{ secrets.INCLUDE_CANVAS_IDS }}   # optional: "796,797,884"
+          INCLUDE_CANVAS_IDS: ${{ secrets.INCLUDE_CANVAS_IDS }}
+          IDS_SOUTHLANDS:     ${{ secrets.IDS_SOUTHLANDS }}
+          IDS_PHOENIX:        ${{ secrets.IDS_PHOENIX }}
+          IDS_1211:          ${{ secrets.IDS_1211 }}
+          IDS_ROCKCHRISTIAN:  ${{ secrets.IDS_ROCKCHRISTIAN }}
+          IDS_GANEVAS:        ${{ secrets.IDS_GANEVAS }}
+        run: |
+          case "${{ matrix.key }}" in
+            B2C)             echo "ids=$INCLUDE_CANVAS_IDS"  >> $GITHUB_OUTPUT ;;
+            SOUTHLANDS)      echo "ids=$IDS_SOUTHLANDS"      >> $GITHUB_OUTPUT ;;
+            PHOENIX)         echo "ids=$IDS_PHOENIX"         >> $GITHUB_OUTPUT ;;
+            ONE_TWO_ONE_ONE) echo "ids=$IDS_1211"            >> $GITHUB_OUTPUT ;;
+            ROCKCHRISTIAN)   echo "ids=$IDS_ROCKCHRISTIAN"   >> $GITHUB_OUTPUT ;;
+            GANEVAS)         echo "ids=$IDS_GANEVAS"         >> $GITHUB_OUTPUT ;;
+            *) echo "Unknown cohort key: ${{ matrix.key }}"; exit 1 ;;
+          esac
+
+      - name: Build per-course CSV for Airtable (${{ matrix.table }})
+        env:
+          API_URL: ${{ secrets.CANVAS_API_URL }}
+          API_KEY: ${{ secrets.CANVAS_API_KEY }}
+          IDS:     ${{ steps.resolve_ids.outputs.ids }}
         run: |
           python - <<'PY'
           import csv, os, time, sys
@@ -44,11 +81,9 @@ jobs:
           IDS     = [s.strip() for s in (os.environ.get("IDS") or "").split(",") if s.strip()]
           HEADERS = {"Authorization": f"Bearer {API_KEY}"}
           PER_PAGE = 100
-          START_MONTH = 8  # school year begins in August; adjust if needed
+          START_MONTH = 8  # school year starts in August; adjust if needed
 
-          def iso(dt):
-              return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
-
+          def iso(dt): return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
           def school_year(dt):
               if not dt: return ""
               y = dt.year
@@ -58,8 +93,7 @@ jobs:
               params = dict(params or {})
               while True:
                   r = requests.get(url, headers=HEADERS, params=params, timeout=60)
-                  if r.status_code in (429,500,502,503,504):
-                      time.sleep(1); continue
+                  if r.status_code in (429,500,502,503,504): time.sleep(1); continue
                   r.raise_for_status()
                   data = r.json()
                   if isinstance(data, list):
@@ -86,21 +120,15 @@ jobs:
                   "Total Assignments","Completed Assignments","Unsubmitted Assignments","% Completed"
               ])
 
-              # Build the working student list
-              student_ids = IDS[:]
-              if not student_ids:
-                  # WARNING: this fetches *all* students; filter with INCLUDE_CANVAS_IDS for large accounts
-                  for u in paged(f"{API_URL}/accounts/self/users",
-                                 {"enrollment_type[]":"student","per_page":PER_PAGE}):
-                      if u.get("id"): student_ids.append(str(u["id"]))
+              if not IDS:
+                  print("[fatal] No Canvas IDs provided for this cohort.", file=sys.stderr)
+                  sys.exit(1)
 
-              for uid in student_ids:
+              for uid in IDS:
                   try:
-                      # name/profile
                       prof = requests.get(f"{API_URL}/users/{uid}/profile", headers=HEADERS, timeout=30)
                       name = (prof.json().get("name") or f"User {uid}") if prof.ok else f"User {uid}"
 
-                      # student enrollments with grades
                       for enr in paged(f"{API_URL}/users/{uid}/enrollments",
                                        {"type[]":"StudentEnrollment","include[]":"grades","per_page":PER_PAGE}):
                           cid = enr.get("course_id")
@@ -109,12 +137,16 @@ jobs:
                           cur = grades.get("current_score")
                           fin = grades.get("final_score")
 
-                          # course details
                           c = requests.get(f"{API_URL}/courses/{cid}", headers=HEADERS, timeout=60)
                           course = c.json() if c.ok else {}
                           cstart = iso(course.get("start_at")) or iso(enr.get("start_at"))
                           cend   = iso(course.get("end_at")) or iso(enr.get("end_at"))
-                          sy     = school_year(cstart or iso(enr.get("created_at")))
+                          sy     = school_year(cstart or iso(enr.get("created_at"))) or "unknown"
+
+                          # Require all parts for a valid key
+                          if not (str(uid).strip() and str(cid).strip() and sy != "unknown"):
+                              print(f"[skip] bad key parts uid={uid} cid={cid} sy={sy}", file=sys.stderr)
+                              continue
 
                           # teachers
                           tnames = []
@@ -125,26 +157,21 @@ jobs:
                               if nm: tnames.append(nm)
                           teachers = ", ".join(sorted(set(tnames)))
 
-                          # basic pass/fail (60 threshold)
+                          # pass/fail (60)
                           passed = ""
                           try:
-                              if fin is not None:
-                                  passed = "Yes" if float(fin) >= 60.0 else "No"
-                          except Exception:
-                              passed = ""
+                              if fin is not None: passed = "Yes" if float(fin) >= 60.0 else "No"
+                          except Exception: passed = ""
 
-                          # basic assignment stats (skip NPS)
+                          # assignments (exclude NPS form)
                           total = comp = unsubmitted = 0
-                          # assignments
-                          for a in paged(f"{API_URL}/courses/{cid}/assignments", None):
-                              if not a.get("published"): 
-                                  continue
-                              if a.get("name") == "End of Unit Feedback (Mandatory)":
-                                  continue
+                          for a in paged(f"{API_URL}/courses/{cid}/assignments"):
+                              if not a.get("published"): continue
+                              if a.get("name") == "End of Unit Feedback (Mandatory)": continue
                               total += 1
-                              # submission
-                              s = requests.get(f"{API_URL}/courses/{cid}/assignments/{a['id']}/submissions/{uid}",
-                                               headers=HEADERS, timeout=30)
+                              s = requests.get(
+                                f"{API_URL}/courses/{cid}/assignments/{a['id']}/submissions/{uid}",
+                                headers=HEADERS, timeout=30)
                               if s.ok:
                                   sub = s.json()
                                   state = sub.get("workflow_state") or "unsubmitted"
@@ -166,30 +193,31 @@ jobs:
                               sy, cid, course.get("course_code") or "", course.get("name") or "",
                               cstart.isoformat() if cstart else "",
                               cend.isoformat() if cend else "",
-                              teachers, cur if cur is not None else "",
-                              fin if fin is not None else "", passed,
-                              total, comp, unsubmitted, pct
+                              teachers,
+                              cur if cur is not None else "",
+                              fin if fin is not None else "",
+                              passed, total, comp, unsubmitted, pct
                           ])
                   except Exception as e:
                       print(f"[warn] failed student {uid}: {e}", file=sys.stderr)
                       continue
 
-          print("[ok] Wrote Canvas_Enrollment_Courses.csv")
+          print("[ok] wrote Canvas_Enrollment_Courses.csv for cohort")
           PY
 
       - name: Upload CSVs (optional)
         uses: actions/upload-artifact@v4
         with:
-          name: canvas-csvs
+          name: canvas-csvs-${{ matrix.key }}
           path: "*.csv"
 
-      - name: Upsert Courses → Airtable
+      - name: Upsert Courses → Airtable (${{ matrix.table }})
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}  # set to: B2C Courses Enrollment
+          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
         run: |
-          # IMPORTANT: School Year must be a text field in Airtable (e.g., "2024-2025")
+          echo "IMPORTANT: Ensure 'School Year' in Airtable is a text field (e.g., 2024-2025)."
           python airtable_upsert.py \
             --base "$AIRTABLE_BASE_ID" \
             --table "$AIRTABLE_TABLE_NAME" \
