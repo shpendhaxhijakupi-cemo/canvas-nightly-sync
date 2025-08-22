@@ -3,7 +3,7 @@ name: Nightly Canvas Export (Cohorts)
 on:
   workflow_dispatch:        # manual runs
   schedule:
-    - cron: "0 2 * * *"     # daily at 02:00 UTC
+    - cron: "0 5 * * *"     # daily at 02:00 UTC
 
 permissions:
   contents: read
