@@ -1,9 +1,9 @@
 name: Nightly Canvas Export (Cohorts)
 
 on:
-  workflow_dispatch:          # allow manual runs
+  workflow_dispatch:
   schedule:
-    - cron: "0 5 * * *"       # daily at 05:00 UTC
+    - cron: "0 5 * * *"
 
 permissions:
   contents: read
@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ---- B2C split into two chunks (no soft-delete here) ----
+          # B2C split (no per-chunk soft-delete)
           - key: B2C_P1
             table: "B2C Courses Enrollment"
             soft_delete: "false"
@@ -23,7 +23,7 @@ jobs:
             table: "B2C Courses Enrollment"
             soft_delete: "false"
 
-          # ---- Other cohorts (with soft-delete) ----
+          # Other cohorts (with soft-delete)
           - key: SOUTHLANDS
             table: "Southlands Courses Enrollment"
             soft_delete: "true"
@@ -57,7 +57,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # Map cohort -> the right Canvas ID secret
       - name: Resolve Canvas IDs for cohort
         id: resolve_ids
         shell: bash
@@ -99,7 +98,7 @@ jobs:
           IDS     = [s.strip() for s in (os.environ.get("IDS") or "").split(",") if s.strip()]
           HEADERS = {"Authorization": f"Bearer {API_KEY}"}
           PER_PAGE = 100
-          START_MONTH = 8  # school year starts in August
+          START_MONTH = 8
 
           def iso(dt): return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
           def school_year(dt):
@@ -111,7 +110,8 @@ jobs:
               params = dict(params or {})
               while True:
                   r = requests.get(url, headers=HEADERS, params=params, timeout=60)
-                  if r.status_code in (429,500,502,503,504): time.sleep(1); continue
+                  if r.status_code in (429,500,502,503,504):
+                      time.sleep(1); continue
                   r.raise_for_status()
                   data = r.json()
                   if isinstance(data, list):
@@ -142,7 +142,6 @@ jobs:
                   print("[fatal] No Canvas IDs provided for this cohort.", file=sys.stderr)
                   sys.exit(1)
 
-              # substring filters (case-insensitive)
               bad_patterns = ("NPS","feedback","survey")
 
               for uid in IDS:
@@ -163,13 +162,9 @@ jobs:
                           cstart = iso(course.get("start_at")) or iso(enr.get("start_at"))
                           cend   = iso(course.get("end_at")) or iso(enr.get("end_at"))
                           sy     = school_year(cstart or iso(enr.get("created_at"))) or "unknown"
-
-                          # require all parts for a valid key
                           if not (str(uid).strip() and str(cid).strip() and sy != "unknown"):
-                              print(f"[skip] bad key parts uid={uid} cid={cid} sy={sy}", file=sys.stderr)
                               continue
 
-                          # teachers
                           tnames = []
                           for t in paged(f"{API_URL}/courses/{cid}/enrollments",
                                          {"type[]":"TeacherEnrollment","per_page":PER_PAGE}):
@@ -178,23 +173,17 @@ jobs:
                               if nm: tnames.append(nm)
                           teachers = ", ".join(sorted(set(tnames)))
 
-                          # pass/fail
                           passed = ""
                           try:
                               if fin is not None: passed = "Yes" if float(fin) >= 60.0 else "No"
                           except Exception: passed = ""
 
-                          # assignments:
-                          # - include published
-                          # - exclude exact "End of Unit Feedback (Mandatory)"
-                          # - exclude names containing NPS|feedback|survey
                           total = comp = unsubmitted = 0
                           for a in paged(f"{API_URL}/courses/{cid}/assignments"):
-                              name_a = (a.get("name") or "")
+                              nm = (a.get("name") or "")
                               if not a.get("published"): continue
-                              if name_a == "End of Unit Feedback (Mandatory)": continue
-                              if any(patt.lower() in name_a.lower() for patt in bad_patterns): continue
-
+                              if nm == "End of Unit Feedback (Mandatory)": continue
+                              if any(x.lower() in nm.lower() for x in bad_patterns): continue
                               total += 1
                               s = requests.get(
                                 f"{API_URL}/courses/{cid}/assignments/{a['id']}/submissions/{uid}",
@@ -210,7 +199,6 @@ jobs:
                                       unsubmitted += 1
                               else:
                                   unsubmitted += 1
-
                           pct = f"{(comp/total*100):.2f}%" if total else "0.00%"
 
                           enr_key = f"{uid}-{sy}"
@@ -230,7 +218,7 @@ jobs:
                       print(f"[warn] failed student {uid}: {e}", file=sys.stderr)
                       continue
 
-          print("[ok] wrote Canvas_Enrollment_Courses.csv for cohort")
+          print("[ok] wrote Canvas_Enrollment_Courses.csv")
           PY
 
       - name: Prepare CSV for upsert (strip Enrollment Key)
@@ -256,6 +244,7 @@ jobs:
           name: canvas-csvs-${{ matrix.key }}
           path: "*.csv"
 
+      # ---------- ROBUST UPSERT (no performUpsert) ----------
       - name: Upsert Courses → Airtable (${{ matrix.table }})
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
@@ -265,29 +254,73 @@ jobs:
           echo "Upserting into Airtable table: $AIRTABLE_TABLE_NAME"
           python - <<'PY'
           import os, csv, requests, time, sys, json
+          from urllib.parse import quote
 
           base  = os.environ["AIRTABLE_BASE_ID"]
           table = os.environ["AIRTABLE_TABLE_NAME"]
           token = os.environ["AIRTABLE_PAT"]
-          api   = f"https://api.airtable.com/v0/{base}/{requests.utils.quote(table, safe='')}"
+          api   = f"https://api.airtable.com/v0/{base}/{quote(table, safe='')}"
           hdr   = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-          rows = []
+          def batched(lst, n=10):
+              for i in range(0, len(lst), n):
+                  yield lst[i:i+n]
+
+          # 1) Read CSV
           with open("Canvas_Enrollment_Courses_for_upsert.csv", newline="", encoding="utf-8") as f:
               rows = list(csv.DictReader(f))
 
-          # merge‑upsert in batches of 10 via 'Enrollment Course Key'
-          for i in range(0, len(rows), 10):
-              batch = rows[i:i+10]
-              payload = {
-                "performUpsert": {"fieldsToMergeOn": ["Enrollment Course Key"]},
-                "records": [{"fields": r} for r in batch]
-              }
-              r = requests.post(api, headers=hdr, data=json.dumps(payload), timeout=60)
+          # 2) Fetch existing (id, key) to build map
+          existing = {}
+          offset = None
+          while True:
+              params = {"pageSize": 100}
+              if offset: params["offset"] = offset
+              r = requests.get(api, headers=hdr, params=params, timeout=60)
+              if not r.ok:
+                  print(f"[error] Read existing failed {r.status_code}: {r.text}")
+                  r.raise_for_status()
+              data = r.json()
+              for rec in data.get("records", []):
+                  key = (rec.get("fields",{}).get("Enrollment Course Key") or "").strip()
+                  if key:
+                      existing[key] = rec["id"]
+              offset = data.get("offset")
+              if not offset: break
+
+          # 3) Split into updates vs creates
+          updates, creates = [], []
+          for row in rows:
+              key = (row.get("Enrollment Course Key") or "").strip()
+              if not key:
+                  continue
+              if key in existing:
+                  updates.append({"id": existing[key], "fields": row})
+              else:
+                  creates.append({"fields": row})
+
+          # 4) PATCH updates
+          total_upd = total_new = 0
+          for batch in batched(updates, 10):
+              r = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
               if r.status_code in (429,500,502,503,504):
-                  time.sleep(2); r = requests.post(api, headers=hdr, data=json.dumps(payload), timeout=60)
-              r.raise_for_status()
-          print("[ok] upserted", len(rows), "rows")
+                  time.sleep(2); r = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if not r.ok:
+                  print(f"[error] PATCH failed {r.status_code}: {r.text}")
+                  r.raise_for_status()
+              total_upd += len(batch)
+
+          # 5) POST creates
+          for batch in batched(creates, 10):
+              r = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if r.status_code in (429,500,502,503,504):
+                  time.sleep(2); r = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if not r.ok:
+                  print(f"[error] POST failed {r.status_code}: {r.text}")
+                  r.raise_for_status()
+              total_new += len(batch)
+
+          print(f"[ok] upsert complete. Updated={total_upd}, Created={total_new}")
           PY
 
       - name: Mark missing records as inactive (soft-delete)
@@ -299,21 +332,20 @@ jobs:
         run: |
           python - <<'PY'
           import os, csv, requests, time, sys
+          from urllib.parse import quote
 
           BASE  = os.environ["AIRTABLE_BASE_ID"]
           TABLE = os.environ["AIRTABLE_TABLE_NAME"]
           TOKEN = os.environ["AIRTABLE_PAT"]
-          API   = f"https://api.airtable.com/v0/{BASE}/{requests.utils.quote(TABLE, safe='')}"
+          API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
           H     = {"Authorization": f"Bearer {TOKEN}"}
 
-          # Current keys from CSV
           current_keys = set()
           with open("Canvas_Enrollment_Courses_for_upsert.csv", newline="", encoding="utf-8") as f:
             for r in csv.DictReader(f):
               k = (r.get("Enrollment Course Key") or "").strip()
               if k: current_keys.add(k)
 
-          # Fetch all existing (id, key)
           existing = []
           offset = None
           while True:
@@ -328,8 +360,7 @@ jobs:
               if key:
                 existing.append((rec["id"], key))
             offset = j.get("offset")
-            if not offset:
-              break
+            if not offset: break
 
           to_mark = [rid for rid, key in existing if key not in current_keys]
           print(f"[info] Existing: {len(existing)}, Current: {len(current_keys)}, Inactive to mark: {len(to_mark)}")
@@ -351,7 +382,6 @@ jobs:
             sys.exit(0)
           PY
 
-  # ---- Final union soft-delete for B2C table (after both chunks finish) ----
   softdelete-b2c:
     needs: run-export
     runs-on: ubuntu-24.04
@@ -375,30 +405,28 @@ jobs:
         run: |
           python - <<'PY'
           import os, csv, requests, time, sys
+          from urllib.parse import quote
 
           TABLE = "B2C Courses Enrollment"
           BASE  = os.environ["AIRTABLE_BASE_ID"]
           TOKEN = os.environ["AIRTABLE_PAT"]
-          API   = f"https://api.airtable.com/v0/{BASE}/{requests.utils.quote(TABLE, safe='')}"
+          API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
           H     = {"Authorization": f"Bearer {TOKEN}"}
 
-          # 1) union of keys from all chunk CSVs
+          # union of keys from chunks
           keyset = set()
           for folder in ("b2c-p1","b2c-p2"):
-              if not os.path.isdir(folder):
-                  continue
+              if not os.path.isdir(folder): continue
               for name in os.listdir(folder):
                   if name.endswith(".csv"):
                       with open(os.path.join(folder, name), newline="", encoding="utf-8") as f:
                           for r in csv.DictReader(f):
                               k = (r.get("Enrollment Course Key") or "").strip()
                               if k: keyset.add(k)
-          print(f"[info] union keys: {len(keyset)}")
           if not keyset:
-              print("[warn] No keys found from B2C chunks; skipping soft-delete.")
-              sys.exit(0)
+              print("[warn] No keys from B2C chunks; skipping soft-delete."); sys.exit(0)
 
-          # 2) fetch existing records
+          # fetch existing
           existing = []
           offset = None
           while True:
@@ -412,9 +440,7 @@ jobs:
               offset = j.get("offset")
               if not offset: break
 
-          # 3) mark inactive where key not in union
           to_mark = [rid for rid, k in existing if k not in keyset]
-          print(f"[info] inactive to mark: {len(to_mark)}")
           for i in range(0, len(to_mark), 10):
               batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
               r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
