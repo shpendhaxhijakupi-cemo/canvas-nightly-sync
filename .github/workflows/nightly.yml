@@ -1,9 +1,9 @@
 name: Nightly Canvas Export (Cohorts)
 
 on:
-  workflow_dispatch:        # manual runs
+  workflow_dispatch:          # allow manual runs
   schedule:
-    - cron: "0 5 * * *"     # daily at 05:00 UTC
+    - cron: "0 5 * * *"       # daily at 05:00 UTC
 
 permissions:
   contents: read
@@ -15,20 +15,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - key: B2C
+          # ---- B2C split into two chunks (no soft-delete here) ----
+          - key: B2C_P1
             table: "B2C Courses Enrollment"
+            soft_delete: "false"
+          - key: B2C_P2
+            table: "B2C Courses Enrollment"
+            soft_delete: "false"
+
+          # ---- Other cohorts (with soft-delete) ----
           - key: SOUTHLANDS
             table: "Southlands Courses Enrollment"
+            soft_delete: "true"
           - key: PHOENIX
             table: "Phoenix Christian Courses Enrollment"
+            soft_delete: "true"
           - key: ONE_TWO_ONE_ONE
             table: "1211 Courses Enrollment"
+            soft_delete: "true"
           - key: ROCKCHRISTIAN
             table: "Rock Christian Courses Enrollment"
+            soft_delete: "true"
           - key: GANEVAS
             table: "Ganevas Courses Enrollment"
+            soft_delete: "true"
           - key: NHCC
             table: "NHCC Courses Enrollment"
+            soft_delete: "true"
 
     steps:
       - name: Checkout
@@ -42,30 +55,31 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
           pip install requests
 
-      # Map cohort -> correct secret of Canvas IDs
+      # Map cohort -> the right Canvas ID secret
       - name: Resolve Canvas IDs for cohort
         id: resolve_ids
         shell: bash
         env:
-          INCLUDE_CANVAS_IDS: ${{ secrets.INCLUDE_CANVAS_IDS }}
-          IDS_SOUTHLANDS:     ${{ secrets.IDS_SOUTHLANDS }}
-          IDS_PHOENIX:        ${{ secrets.IDS_PHOENIX }}
-          IDS_1211:           ${{ secrets.IDS_1211 }}
-          IDS_ROCKCHRISTIAN:  ${{ secrets.IDS_ROCKCHRISTIAN }}
-          IDS_GANEVAS:        ${{ secrets.IDS_GANEVAS }}
-          IDS_NHCC:           ${{ secrets.IDS_NHCC }}
+          INCLUDE_CANVAS_IDS_P1: ${{ secrets.INCLUDE_CANVAS_IDS_P1 }}
+          INCLUDE_CANVAS_IDS_P2: ${{ secrets.INCLUDE_CANVAS_IDS_P2 }}
+          IDS_SOUTHLANDS:        ${{ secrets.IDS_SOUTHLANDS }}
+          IDS_PHOENIX:           ${{ secrets.IDS_PHOENIX }}
+          IDS_1211:              ${{ secrets.IDS_1211 }}
+          IDS_ROCKCHRISTIAN:     ${{ secrets.IDS_ROCKCHRISTIAN }}
+          IDS_GANEVAS:           ${{ secrets.IDS_GANEVAS }}
+          IDS_NHCC:              ${{ secrets.IDS_NHCC }}
         run: |
           case "${{ matrix.key }}" in
-            B2C)             echo "ids=$INCLUDE_CANVAS_IDS"  >> $GITHUB_OUTPUT ;;
-            SOUTHLANDS)      echo "ids=$IDS_SOUTHLANDS"      >> $GITHUB_OUTPUT ;;
-            PHOENIX)         echo "ids=$IDS_PHOENIX"         >> $GITHUB_OUTPUT ;;
-            ONE_TWO_ONE_ONE) echo "ids=$IDS_1211"            >> $GITHUB_OUTPUT ;;
-            ROCKCHRISTIAN)   echo "ids=$IDS_ROCKCHRISTIAN"   >> $GITHUB_OUTPUT ;;
-            GANEVAS)         echo "ids=$IDS_GANEVAS"         >> $GITHUB_OUTPUT ;;
-            NHCC)            echo "ids=$IDS_NHCC"            >> $GITHUB_OUTPUT ;;
+            B2C_P1)          echo "ids=$INCLUDE_CANVAS_IDS_P1" >> $GITHUB_OUTPUT ;;
+            B2C_P2)          echo "ids=$INCLUDE_CANVAS_IDS_P2" >> $GITHUB_OUTPUT ;;
+            SOUTHLANDS)      echo "ids=$IDS_SOUTHLANDS"        >> $GITHUB_OUTPUT ;;
+            PHOENIX)         echo "ids=$IDS_PHOENIX"           >> $GITHUB_OUTPUT ;;
+            ONE_TWO_ONE_ONE) echo "ids=$IDS_1211"              >> $GITHUB_OUTPUT ;;
+            ROCKCHRISTIAN)   echo "ids=$IDS_ROCKCHRISTIAN"     >> $GITHUB_OUTPUT ;;
+            GANEVAS)         echo "ids=$IDS_GANEVAS"           >> $GITHUB_OUTPUT ;;
+            NHCC)            echo "ids=$IDS_NHCC"              >> $GITHUB_OUTPUT ;;
             *) echo "Unknown cohort key: ${{ matrix.key }}"; exit 1 ;;
           esac
 
@@ -128,13 +142,13 @@ jobs:
                   print("[fatal] No Canvas IDs provided for this cohort.", file=sys.stderr)
                   sys.exit(1)
 
-              # Substring filters (case-insensitive)
-              bad_patterns = ("NPS", "feedback", "survey")
+              # substring filters (case-insensitive)
+              bad_patterns = ("NPS","feedback","survey")
 
               for uid in IDS:
                   try:
-                      prof = requests.get(f"{API_URL}/users/{uid}/profile", headers=HEADERS, timeout=30)
-                      name = (prof.json().get("name") or f"User {uid}") if prof.ok else f"User {uid}"
+                      p = requests.get(f"{API_URL}/users/{uid}/profile", headers=HEADERS, timeout=30)
+                      name = (p.json().get("name") or f"User {uid}") if p.ok else f"User {uid}"
 
                       for enr in paged(f"{API_URL}/users/{uid}/enrollments",
                                        {"type[]":"StudentEnrollment","include[]":"grades","per_page":PER_PAGE}):
@@ -150,7 +164,7 @@ jobs:
                           cend   = iso(course.get("end_at")) or iso(enr.get("end_at"))
                           sy     = school_year(cstart or iso(enr.get("created_at"))) or "unknown"
 
-                          # Require all parts for a valid key
+                          # require all parts for a valid key
                           if not (str(uid).strip() and str(cid).strip() and sy != "unknown"):
                               print(f"[skip] bad key parts uid={uid} cid={cid} sy={sy}", file=sys.stderr)
                               continue
@@ -173,13 +187,13 @@ jobs:
                           # assignments:
                           # - include published
                           # - exclude exact "End of Unit Feedback (Mandatory)"
-                          # - exclude names containing NPS|feedback|survey (case-insensitive)
+                          # - exclude names containing NPS|feedback|survey
                           total = comp = unsubmitted = 0
                           for a in paged(f"{API_URL}/courses/{cid}/assignments"):
                               name_a = (a.get("name") or "")
                               if not a.get("published"): continue
                               if name_a == "End of Unit Feedback (Mandatory)": continue
-                              if any(p.lower() in name_a.lower() for p in bad_patterns): continue
+                              if any(patt.lower() in name_a.lower() for patt in bad_patterns): continue
 
                               total += 1
                               s = requests.get(
@@ -196,6 +210,7 @@ jobs:
                                       unsubmitted += 1
                               else:
                                   unsubmitted += 1
+
                           pct = f"{(comp/total*100):.2f}%" if total else "0.00%"
 
                           enr_key = f"{uid}-{sy}"
@@ -235,7 +250,7 @@ jobs:
           print("[ok] wrote", dst)
           PY
 
-      - name: Upload CSVs (optional)
+      - name: Upload CSVs (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: canvas-csvs-${{ matrix.key }}
@@ -247,23 +262,43 @@ jobs:
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_NAME: ${{ matrix.table }}
         run: |
-          echo "IMPORTANT: Ensure 'School Year' in Airtable is a text field (e.g., 2024-2025)."
-          python airtable_upsert.py \
-            --base "$AIRTABLE_BASE_ID" \
-            --table "$AIRTABLE_TABLE_NAME" \
-            --token "$AIRTABLE_PAT" \
-            --csv "Canvas_Enrollment_Courses_for_upsert.csv" \
-            --unique-field "Enrollment Course Key" \
-            --typecast
+          echo "Upserting into Airtable table: $AIRTABLE_TABLE_NAME"
+          python - <<'PY'
+          import os, csv, requests, time, sys, json
+
+          base  = os.environ["AIRTABLE_BASE_ID"]
+          table = os.environ["AIRTABLE_TABLE_NAME"]
+          token = os.environ["AIRTABLE_PAT"]
+          api   = f"https://api.airtable.com/v0/{base}/{requests.utils.quote(table, safe='')}"
+          hdr   = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+          rows = []
+          with open("Canvas_Enrollment_Courses_for_upsert.csv", newline="", encoding="utf-8") as f:
+              rows = list(csv.DictReader(f))
+
+          # merge‑upsert in batches of 10 via 'Enrollment Course Key'
+          for i in range(0, len(rows), 10):
+              batch = rows[i:i+10]
+              payload = {
+                "performUpsert": {"fieldsToMergeOn": ["Enrollment Course Key"]},
+                "records": [{"fields": r} for r in batch]
+              }
+              r = requests.post(api, headers=hdr, data=json.dumps(payload), timeout=60)
+              if r.status_code in (429,500,502,503,504):
+                  time.sleep(2); r = requests.post(api, headers=hdr, data=json.dumps(payload), timeout=60)
+              r.raise_for_status()
+          print("[ok] upserted", len(rows), "rows")
+          PY
 
       - name: Mark missing records as inactive (soft-delete)
+        if: ${{ matrix.soft_delete != 'false' }}
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_NAME: ${{ matrix.table }}
         run: |
           python - <<'PY'
-          import os, csv, requests, time
+          import os, csv, requests, time, sys
 
           BASE  = os.environ["AIRTABLE_BASE_ID"]
           TABLE = os.environ["AIRTABLE_TABLE_NAME"]
@@ -296,26 +331,98 @@ jobs:
             if not offset:
               break
 
-          # Records to mark inactive
           to_mark = [rid for rid, key in existing if key not in current_keys]
           print(f"[info] Existing: {len(existing)}, Current: {len(current_keys)}, Inactive to mark: {len(to_mark)}")
 
+          try:
+            for i in range(0, len(to_mark), 10):
+              batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
+              r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
+                                 json={"records": batch, "typecast": True}, timeout=60)
+              if r.status_code in (429,500,502,503,504):
+                time.sleep(2)
+                r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
+                                   json={"records": batch, "typecast": True}, timeout=60)
+              r.raise_for_status()
+            print("[ok] soft-delete complete")
+          except requests.HTTPError as e:
+            print(f"[warn] Soft-delete skipped for table '{TABLE}': {e}. "
+                  f"Add an 'Active' checkbox field to enable soft-delete.")
+            sys.exit(0)
+          PY
+
+  # ---- Final union soft-delete for B2C table (after both chunks finish) ----
+  softdelete-b2c:
+    needs: run-export
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download B2C P1 CSV
+        uses: actions/download-artifact@v4
+        with:
+          name: canvas-csvs-B2C_P1
+          path: b2c-p1
+
+      - name: Download B2C P2 CSV
+        uses: actions/download-artifact@v4
+        with:
+          name: canvas-csvs-B2C_P2
+          path: b2c-p2
+
+      - name: Union soft-delete for B2C
+        env:
+          AIRTABLE_PAT:     ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+        run: |
+          python - <<'PY'
+          import os, csv, requests, time, sys
+
+          TABLE = "B2C Courses Enrollment"
+          BASE  = os.environ["AIRTABLE_BASE_ID"]
+          TOKEN = os.environ["AIRTABLE_PAT"]
+          API   = f"https://api.airtable.com/v0/{BASE}/{requests.utils.quote(TABLE, safe='')}"
+          H     = {"Authorization": f"Bearer {TOKEN}"}
+
+          # 1) union of keys from all chunk CSVs
+          keyset = set()
+          for folder in ("b2c-p1","b2c-p2"):
+              if not os.path.isdir(folder):
+                  continue
+              for name in os.listdir(folder):
+                  if name.endswith(".csv"):
+                      with open(os.path.join(folder, name), newline="", encoding="utf-8") as f:
+                          for r in csv.DictReader(f):
+                              k = (r.get("Enrollment Course Key") or "").strip()
+                              if k: keyset.add(k)
+          print(f"[info] union keys: {len(keyset)}")
+          if not keyset:
+              print("[warn] No keys found from B2C chunks; skipping soft-delete.")
+              sys.exit(0)
+
+          # 2) fetch existing records
+          existing = []
+          offset = None
+          while True:
+              params = {"pageSize": 100}
+              if offset: params["offset"] = offset
+              r = requests.get(API, headers=H, params=params, timeout=60); r.raise_for_status()
+              j = r.json()
+              for rec in j.get("records", []):
+                  k = (rec.get("fields",{}).get("Enrollment Course Key") or "").strip()
+                  if k: existing.append((rec["id"], k))
+              offset = j.get("offset")
+              if not offset: break
+
+          # 3) mark inactive where key not in union
+          to_mark = [rid for rid, k in existing if k not in keyset]
+          print(f"[info] inactive to mark: {len(to_mark)}")
           for i in range(0, len(to_mark), 10):
-            batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
-            r = requests.patch(
-              API,
-              headers={**H, "Content-Type": "application/json"},
-              json={"records": batch, "typecast": True},
-              timeout=60
-            )
-            if r.status_code in (429, 500, 502, 503, 504):
-              time.sleep(2)
-              r = requests.patch(
-                API,
-                headers={**H, "Content-Type": "application/json"},
-                json={"records": batch, "typecast": True},
-                timeout=60
-              )
-            r.raise_for_status()
-          print("[ok] Soft-delete complete")
+              batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
+              r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
+                                 json={"records": batch, "typecast": True}, timeout=60)
+              if r.status_code in (429,500,502,503,504):
+                  time.sleep(2)
+                  r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
+                                     json={"records": batch, "typecast": True}, timeout=60)
+              r.raise_for_status()
+          print("[ok] B2C union soft-delete complete")
           PY
