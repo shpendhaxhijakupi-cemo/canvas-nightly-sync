@@ -3,7 +3,7 @@ name: Nightly Canvas Export (Students)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 5 * * *"  # offset to avoid clashing with Courses job
+    - cron: "30 5 * * *"  # offset from Courses job to avoid overlap
 
 permissions:
   contents: read
@@ -13,9 +13,10 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
+    # Each matrix row maps to one Airtable "Student Enrollments" table
       matrix:
         include:
-          # B2C split (no union soft-delete per chunk; handled in a separate job below)
+          # B2C split (no per-chunk soft-delete here; handled by union job below)
           - key: B2C_P1
             table: "B2C Student Enrollments"
             soft_delete: "false"
@@ -99,13 +100,14 @@ jobs:
           IDS     = [s.strip() for s in (os.environ.get("IDS") or "").split(",") if s.strip()]
           HEADERS = {"Authorization": f"Bearer {API_KEY}"}
           PER_PAGE = 100
-          START_MONTH = 8  # August; adjust if your school year rolls differently
+          START_MONTH = 8  # August; adjust if your school year differs
 
-          def iso(dt): 
+          def iso(dt):
               return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
 
           def school_year(dt):
-              if not dt: return ""
+              if not dt:
+                  return ""
               y = dt.year
               return f"{y-1}-{y}" if dt.month < START_MONTH else f"{y}-{y+1}"
 
@@ -134,8 +136,7 @@ jobs:
               print("[fatal] No Canvas IDs provided for this cohort.", file=sys.stderr)
               sys.exit(1)
 
-          # Accumulate per student per school year
-          aggregates = {}  # key -> dict row
+          aggregates = {}  # key=f"{uid}-{sy}" -> row
 
           for uid in IDS:
               try:
@@ -147,7 +148,7 @@ jobs:
                   enrollments = list(paged(f"{API_URL}/users/{uid}/enrollments",
                                            {"type[]":"StudentEnrollment","include[]":"grades","per_page":PER_PAGE}))
 
-                  # group enrollments by school-year
+                  # group by school-year
                   by_year = {}
                   for enr in enrollments:
                       created = iso(enr.get("created_at"))
@@ -162,11 +163,7 @@ jobs:
                       overall_current_scores = []
                       overall_final_scores = []
                       year_total = year_completed = year_unsubmitted = 0
-
-                      # initial enrollment date = earliest created_at across the year's enrollments
                       initial_enrollment = None
-
-                      # observer linked?
                       observer_linked = "No"
 
                       bad_patterns = ("NPS","feedback","survey")
@@ -187,7 +184,7 @@ jobs:
                           if not cid: 
                               continue
 
-                          # Count assignments/submissions like in the courses job
+                          # Count assignments/submissions (same filtering style as courses job)
                           total = comp = unsubmitted = 0
                           for a in paged(f"{API_URL}/courses/{cid}/assignments"):
                               nm = (a.get("name") or "")
@@ -218,7 +215,7 @@ jobs:
                           year_completed   += comp
                           year_unsubmitted += unsubmitted
 
-                          # detect observer link for this student (any course is enough)
+                          # Observer link detection (any course -> Yes)
                           if observer_linked != "Yes":
                               try:
                                   for obs in paged(f"{API_URL}/courses/{cid}/enrollments",
@@ -229,7 +226,6 @@ jobs:
                               except Exception:
                                   pass
 
-                      # prepare aggregated row
                       def avg_or_blank(nums):
                           try:
                               vals = [float(x) for x in nums if x is not None]
@@ -297,7 +293,7 @@ jobs:
           name: student-csvs-${{ matrix.key }}
           path: "*.csv"
 
-      # ---------- Robust upsert (same style as your courses upsert) ----------
+      # ---------- Upsert with schema preflight (full-field; exact match to CSV headers) ----------
       - name: Upsert Students → Airtable (${{ matrix.table }})
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
@@ -306,7 +302,7 @@ jobs:
         run: |
           echo "Upserting into Airtable table: $AIRTABLE_TABLE_NAME"
           python - <<'PY'
-          import os, csv, requests, time, sys, json
+          import os, csv, requests, time, sys
           from urllib.parse import quote
 
           base  = os.environ["AIRTABLE_BASE_ID"]
@@ -315,62 +311,100 @@ jobs:
           api   = f"https://api.airtable.com/v0/{base}/{quote(table, safe='')}"
           hdr   = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
+          KEY_FIELD = "Enrollment Key"
+
           def batched(lst, n=10):
               for i in range(0, len(lst), n):
                   yield lst[i:i+n]
 
           # 1) Read CSV
           with open("Canvas_Enrollments.csv", newline="", encoding="utf-8") as f:
-              rows = list(csv.DictReader(f))
+              r = csv.DictReader(f)
+              csv_headers = r.fieldnames or []
+              rows = list(r)
 
-          # 2) Fetch existing (id, key) to build map
-          existing = {}
+          if KEY_FIELD not in csv_headers:
+              print(f"[fatal] CSV is missing required key field: {KEY_FIELD}", file=sys.stderr)
+              sys.exit(1)
+
+          # 2) Discover Airtable fields by reading existing records (no schema endpoint available)
+          existing_fields = set()
           offset = None
           while True:
               params = {"pageSize": 100}
               if offset: params["offset"] = offset
-              r = requests.get(api, headers=hdr, params=params, timeout=60)
-              if not r.ok:
-                  print(f("[error] Read existing failed {r.status_code}: {r.text}"))
-                  r.raise_for_status()
-              data = r.json()
+              rr = requests.get(api, headers=hdr, params=params, timeout=60)
+              if not rr.ok:
+                  print(f"[error] Field discovery failed {rr.status_code}: {rr.text[:300]}")
+                  rr.raise_for_status()
+              data = rr.json()
               for rec in data.get("records", []):
-                  key = (rec.get("fields",{}).get("Enrollment Key") or "").strip()
-                  if key:
-                      existing[key] = rec["id"]
+                  for k in (rec.get("fields") or {}).keys():
+                      existing_fields.add(k)
               offset = data.get("offset")
-              if not offset: break
+              if not offset:
+                  break
 
-          # 3) Split into updates vs creates
+          # 3) Validate schema if we discovered any fields
+          missing = [h for h in csv_headers if h not in existing_fields] if existing_fields else []
+          if existing_fields and missing:
+              print("[fatal] The Airtable table is missing these CSV columns:")
+              for m in missing:
+                  print("  -", m)
+              print("\nAdd these fields to the Airtable table (plus your 'Active' checkbox) and rerun.")
+              sys.exit(1)
+          elif not existing_fields:
+              print("[warn] Could not discover Airtable fields (table may be empty). Proceeding with full-field upsert.")
+
+          # 4) Build existing key → recordId map
+          existing_map = {}
+          offset = None
+          while True:
+              params = {"pageSize": 100}
+              if offset: params["offset"] = offset
+              rr = requests.get(api, headers=hdr, params=params, timeout=60)
+              if not rr.ok:
+                  print(f"[error] Read existing failed {rr.status_code}: {rr.text[:300]}")
+                  rr.raise_for_status()
+              data = rr.json()
+              for rec in data.get("records", []):
+                  key = (rec.get("fields",{}).get(KEY_FIELD) or "").strip()
+                  if key:
+                      existing_map[key] = rec["id"]
+              offset = data.get("offset")
+              if not offset:
+                  break
+
+          # 5) Split updates vs creates (use ALL CSV fields)
           updates, creates = [], []
           for row in rows:
-              key = (row.get("Enrollment Key") or "").strip()
+              key = (row.get(KEY_FIELD) or "").strip()
               if not key:
                   continue
-              if key in existing:
-                  updates.append({"id": existing[key], "fields": row})
+              if key in existing_map:
+                  updates.append({"id": existing_map[key], "fields": row})
               else:
                   creates.append({"fields": row})
 
-          # 4) PATCH updates
+          # 6) PATCH updates
           total_upd = total_new = 0
           for batch in batched(updates, 10):
-              r = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
-              if r.status_code in (429,500,502,503,504):
-                  time.sleep(2); r = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
-              if not r.ok:
-                  print(f"[error] PATCH failed {r.status_code}: {r.text}")
-                  r.raise_for_status()
+              rr = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if rr.status_code in (429,500,502,503,504):
+                  time.sleep(2); rr = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if not rr.ok:
+                  print(f"[error] PATCH failed {rr.status_code}: {rr.text[:500]}")
+                  rr.raise_for_status()
               total_upd += len(batch)
 
-          # 5) POST creates
+          # 7) POST creates
           for batch in batched(creates, 10):
-              r = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
-              if r.status_code in (429,500,502,503,504):
-                  time.sleep(2); r = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
-              if not r.ok:
-                  print(f"[error] POST failed {r.status_code}: {r.text}")
-                  r.raise_for_status()
+              rr = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if rr.status_code in (429,500,502,503,504):
+                  time.sleep(2); rr = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if not rr.ok:
+                  print(f"[error] POST failed {rr.status_code}: {rr.text[:500]}")
+                  rr.raise_for_status()
               total_new += len(batch)
 
           print(f"[ok] upsert complete. Updated={total_upd}, Created={total_new}")
@@ -435,7 +469,7 @@ jobs:
             sys.exit(0)
           PY
 
-  # Union soft-delete for B2C across P1/P2 (Students)
+  # ---------- Union soft-delete for B2C Students across P1/P2 ----------
   softdelete-b2c-students:
     needs: run-export-students
     runs-on: ubuntu-24.04
@@ -445,6 +479,7 @@ jobs:
         with:
           name: student-csvs-B2C_P1
           path: b2c-p1
+
       - name: Download B2C P2 CSV
         uses: actions/download-artifact@v4
         with:
@@ -466,7 +501,7 @@ jobs:
           API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
           H     = {"Authorization": f"Bearer {TOKEN}"}
 
-          # Union of Enrollment Keys from both chunks
+          # union of Enrollment Keys from both chunks
           keyset = set()
           for folder in ("b2c-p1","b2c-p2"):
               if not os.path.isdir(folder): continue
@@ -479,7 +514,7 @@ jobs:
           if not keyset:
               print("[warn] No Enrollment Keys from B2C chunks; skipping soft-delete."); sys.exit(0)
 
-          # Fetch existing keys
+          # fetch existing
           existing = []
           offset = None
           while True:
