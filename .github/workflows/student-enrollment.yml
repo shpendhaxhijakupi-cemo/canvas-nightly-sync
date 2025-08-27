@@ -1,0 +1,118 @@
+name: Nightly Canvas Export (Students)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 5 * * *"   # offset 30min later to not clash
+
+permissions:
+  contents: read
+
+jobs:
+  students-export:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: B2C_P1
+            table: "B2C Student Enrollments"
+            soft_delete: "false"
+          - key: B2C_P2
+            table: "B2C Student Enrollments"
+            soft_delete: "false"
+          - key: SOUTHLANDS
+            table: "Southlands Student Enrollments"
+            soft_delete: "true"
+          - key: PHOENIX
+            table: "Phoenix Christian Student Enrollments"
+            soft_delete: "true"
+          - key: ONE_TWO_ONE_ONE
+            table: "1211 Student Enrollments"
+            soft_delete: "true"
+          - key: NHCC
+            table: "NHCC Student Enrollments"
+            soft_delete: "true"
+          - key: ROCKCHRISTIAN
+            table: "Rock Christian Student Enrollments"
+            soft_delete: "true"
+          - key: GANEVAS
+            table: "Ganevas Student Enrollments"
+            soft_delete: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Resolve Canvas IDs
+        id: resolve_ids
+        shell: bash
+        env:
+          INCLUDE_CANVAS_IDS_P1: ${{ secrets.INCLUDE_CANVAS_IDS_P1 }}
+          INCLUDE_CANVAS_IDS_P2: ${{ secrets.INCLUDE_CANVAS_IDS_P2 }}
+          IDS_SOUTHLANDS:        ${{ secrets.IDS_SOUTHLANDS }}
+          IDS_PHOENIX:           ${{ secrets.IDS_PHOENIX }}
+          IDS_1211:              ${{ secrets.IDS_1211 }}
+          IDS_ROCKCHRISTIAN:     ${{ secrets.IDS_ROCKCHRISTIAN }}
+          IDS_GANEVAS:           ${{ secrets.IDS_GANEVAS }}
+          IDS_NHCC:              ${{ secrets.IDS_NHCC }}
+        run: |
+          case "${{ matrix.key }}" in
+            B2C_P1)          echo "ids=$INCLUDE_CANVAS_IDS_P1" >> $GITHUB_OUTPUT ;;
+            B2C_P2)          echo "ids=$INCLUDE_CANVAS_IDS_P2" >> $GITHUB_OUTPUT ;;
+            SOUTHLANDS)      echo "ids=$IDS_SOUTHLANDS"        >> $GITHUB_OUTPUT ;;
+            PHOENIX)         echo "ids=$IDS_PHOENIX"           >> $GITHUB_OUTPUT ;;
+            ONE_TWO_ONE_ONE) echo "ids=$IDS_1211"              >> $GITHUB_OUTPUT ;;
+            ROCKCHRISTIAN)   echo "ids=$IDS_ROCKCHRISTIAN"     >> $GITHUB_OUTPUT ;;
+            GANEVAS)         echo "ids=$IDS_GANEVAS"           >> $GITHUB_OUTPUT ;;
+            NHCC)            echo "ids=$IDS_NHCC"              >> $GITHUB_OUTPUT ;;
+            *) echo "Unknown cohort key: ${{ matrix.key }}"; exit 1 ;;
+          esac
+
+      - name: Filter Student CSV for cohort
+        env:
+          IDS: ${{ steps.resolve_ids.outputs.ids }}
+        run: |
+          python - <<'PY'
+          import csv, os, sys
+          ids = set(s.strip() for s in (os.environ.get("IDS") or "").split(",") if s.strip())
+          if not ids:
+              print("[fatal] No Canvas IDs for cohort.", file=sys.stderr)
+              sys.exit(1)
+          src = "Canvas_Enrollments.csv"              # committed or generated student CSV
+          dst = "Canvas_Enrollments_for_upsert.csv"
+          kept = 0
+          with open(src, newline="", encoding="utf-8") as f, open(dst, "w", newline="", encoding="utf-8") as g:
+              r = csv.DictReader(f)
+              if "Student Canvas ID" not in r.fieldnames or "Enrollment Key" not in r.fieldnames:
+                  print("[fatal] Missing required columns.", file=sys.stderr)
+                  sys.exit(1)
+              w = csv.DictWriter(g, fieldnames=r.fieldnames)
+              w.writeheader()
+              for row in r:
+                  if str(row.get("Student Canvas ID","")).strip() in ids:
+                      w.writerow(row); kept += 1
+          print(f"[ok] wrote {dst} with {kept} rows.")
+          PY
+
+      - name: Upsert Student Enrollments → Airtable (${{ matrix.table }})
+        env:
+          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
+          CSV_PATH:            "Canvas_Enrollments_for_upsert.csv"
+          UNIQUE_KEY:          "Enrollment Key"
+          AIRTABLE_TYPECAST:   "true"
+          AIRTABLE_SOFT_DELETE: ${{ matrix.soft_delete }}
+        run: |
+          python scripts/upsert_csv_to_airtable.py
