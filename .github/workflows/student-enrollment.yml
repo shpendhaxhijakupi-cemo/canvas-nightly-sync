@@ -3,24 +3,27 @@ name: Nightly Canvas Export (Students)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 5 * * *"   # offset 30min later to not clash
+    - cron: "30 5 * * *"  # offset to avoid clashing with Courses job
 
 permissions:
   contents: read
 
 jobs:
-  students-export:
+  run-export-students:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
+          # B2C split (no union soft-delete per chunk; handled in a separate job below)
           - key: B2C_P1
             table: "B2C Student Enrollments"
             soft_delete: "false"
           - key: B2C_P2
             table: "B2C Student Enrollments"
             soft_delete: "false"
+
+          # Other cohorts (with soft-delete)
           - key: SOUTHLANDS
             table: "Southlands Student Enrollments"
             soft_delete: "true"
@@ -54,7 +57,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Resolve Canvas IDs
+      - name: Resolve Canvas IDs for cohort
         id: resolve_ids
         shell: bash
         env:
@@ -79,40 +82,426 @@ jobs:
             *) echo "Unknown cohort key: ${{ matrix.key }}"; exit 1 ;;
           esac
 
-      - name: Filter Student CSV for cohort
+      # ---------- Build per-student-year CSV (same style as your courses step) ----------
+      - name: Build per-student CSV for Airtable (${{ matrix.table }})
         env:
-          IDS: ${{ steps.resolve_ids.outputs.ids }}
+          API_URL: ${{ secrets.CANVAS_API_URL }}
+          API_KEY: ${{ secrets.CANVAS_API_KEY }}
+          IDS:     ${{ steps.resolve_ids.outputs.ids }}
         run: |
           python - <<'PY'
-          import csv, os, sys
-          ids = set(s.strip() for s in (os.environ.get("IDS") or "").split(",") if s.strip())
-          if not ids:
-              print("[fatal] No Canvas IDs for cohort.", file=sys.stderr)
+          import csv, os, time, sys
+          from datetime import datetime
+          import requests
+
+          API_URL = os.environ["API_URL"].rstrip("/")
+          API_KEY = os.environ["API_KEY"]
+          IDS     = [s.strip() for s in (os.environ.get("IDS") or "").split(",") if s.strip()]
+          HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+          PER_PAGE = 100
+          START_MONTH = 8  # August; adjust if your school year rolls differently
+
+          def iso(dt): 
+              return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
+
+          def school_year(dt):
+              if not dt: return ""
+              y = dt.year
+              return f"{y-1}-{y}" if dt.month < START_MONTH else f"{y}-{y+1}"
+
+          def paged(url, params=None):
+              params = dict(params or {})
+              while True:
+                  r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+                  if r.status_code in (429,500,502,503,504):
+                      time.sleep(1); continue
+                  r.raise_for_status()
+                  data = r.json()
+                  if isinstance(data, list):
+                      for x in data: yield x
+                  else:
+                      yield data
+                  link = r.headers.get("Link","")
+                  nxt = None
+                  for part in link.split(","):
+                      if 'rel="next"' in part:
+                          nxt = part[part.find("<")+1: part.find(">")]
+                          break
+                  if not nxt: break
+                  url, params = nxt, None
+
+          if not IDS:
+              print("[fatal] No Canvas IDs provided for this cohort.", file=sys.stderr)
               sys.exit(1)
-          src = "Canvas_Enrollments.csv"              # committed or generated student CSV
-          dst = "Canvas_Enrollments_for_upsert.csv"
-          kept = 0
-          with open(src, newline="", encoding="utf-8") as f, open(dst, "w", newline="", encoding="utf-8") as g:
-              r = csv.DictReader(f)
-              if "Student Canvas ID" not in r.fieldnames or "Enrollment Key" not in r.fieldnames:
-                  print("[fatal] Missing required columns.", file=sys.stderr)
-                  sys.exit(1)
-              w = csv.DictWriter(g, fieldnames=r.fieldnames)
+
+          # Accumulate per student per school year
+          aggregates = {}  # key -> dict row
+
+          for uid in IDS:
+              try:
+                  prof = requests.get(f"{API_URL}/users/{uid}/profile", headers=HEADERS, timeout=30)
+                  prof_j = prof.json() if prof.ok else {}
+                  student_name = prof_j.get("name") or f"User {uid}"
+                  email        = prof_j.get("primary_email") or prof_j.get("login_id") or ""
+
+                  enrollments = list(paged(f"{API_URL}/users/{uid}/enrollments",
+                                           {"type[]":"StudentEnrollment","include[]":"grades","per_page":PER_PAGE}))
+
+                  # group enrollments by school-year
+                  by_year = {}
+                  for enr in enrollments:
+                      created = iso(enr.get("created_at"))
+                      sy = school_year(created) or "unknown"
+                      if sy == "unknown":
+                          continue
+                      by_year.setdefault(sy, []).append(enr)
+
+                  for sy, enrs in by_year.items():
+                      key = f"{uid}-{sy}"
+                      total_courses = 0
+                      overall_current_scores = []
+                      overall_final_scores = []
+                      year_total = year_completed = year_unsubmitted = 0
+
+                      # initial enrollment date = earliest created_at across the year's enrollments
+                      initial_enrollment = None
+
+                      # observer linked?
+                      observer_linked = "No"
+
+                      bad_patterns = ("NPS","feedback","survey")
+
+                      for enr in enrs:
+                          created = iso(enr.get("created_at"))
+                          if created and (initial_enrollment is None or created < initial_enrollment):
+                              initial_enrollment = created
+
+                          grades = enr.get("grades") or {}
+                          cur = grades.get("current_score")
+                          fin = grades.get("final_score")
+                          if cur is not None: overall_current_scores.append(cur)
+                          if fin is not None: overall_final_scores.append(fin)
+                          total_courses += 1
+
+                          cid = enr.get("course_id")
+                          if not cid: 
+                              continue
+
+                          # Count assignments/submissions like in the courses job
+                          total = comp = unsubmitted = 0
+                          for a in paged(f"{API_URL}/courses/{cid}/assignments"):
+                              nm = (a.get("name") or "")
+                              if not a.get("published"): 
+                                  continue
+                              if nm == "End of Unit Feedback (Mandatory)": 
+                                  continue
+                              if any(x.lower() in nm.lower() for x in bad_patterns):
+                                  continue
+                              total += 1
+                              s = requests.get(
+                                  f"{API_URL}/courses/{cid}/assignments/{a['id']}/submissions/{uid}",
+                                  headers=HEADERS, timeout=30)
+                              if s.ok:
+                                  sub = s.json()
+                                  if sub.get("excused"):
+                                      comp += 1
+                                  else:
+                                      state = sub.get("workflow_state") or "unsubmitted"
+                                      graded = sub.get("grade") not in (None,"-","")
+                                      if state in ("graded","submitted") and graded:
+                                          comp += 1
+                                      else:
+                                          unsubmitted += 1
+                              else:
+                                  unsubmitted += 1
+                          year_total       += total
+                          year_completed   += comp
+                          year_unsubmitted += unsubmitted
+
+                          # detect observer link for this student (any course is enough)
+                          if observer_linked != "Yes":
+                              try:
+                                  for obs in paged(f"{API_URL}/courses/{cid}/enrollments",
+                                                   {"type[]":"ObserverEnrollment","include[]":"user","per_page":PER_PAGE}):
+                                      if int(obs.get("associated_user_id") or 0) == int(uid):
+                                          observer_linked = "Yes"
+                                          break
+                              except Exception:
+                                  pass
+
+                      # prepare aggregated row
+                      def avg_or_blank(nums):
+                          try:
+                              vals = [float(x) for x in nums if x is not None]
+                              return round(sum(vals)/len(vals), 2) if vals else ""
+                          except Exception:
+                              return ""
+
+                      aggregates[key] = {
+                          "Enrollment Key": key,
+                          "Student Canvas ID": uid,
+                          "Student Name": student_name,
+                          "School Year": sy,
+                          "Program": "",
+                          "Initial Enrollment Date": initial_enrollment.isoformat() if initial_enrollment else "",
+                          "Year Start Date": "",
+                          "Year Completion Date": "",
+                          "Overall Current Score": avg_or_blank(overall_current_scores),
+                          "Overall Final Score": avg_or_blank(overall_final_scores),
+                          "Notes": "",
+                          "Total Courses": total_courses,
+                          "Year Total Assignments": year_total,
+                          "Year Completed Assignments": year_completed,
+                          "Year Unsubmitted Assignments": year_unsubmitted,
+                          "Student First Name": "",
+                          "Student Last Name": "",
+                          "Student ID nese ka (per SCS)": "",
+                          "Student Date of Birth": "",
+                          "Email": email,
+                          "Parent First Name": "",
+                          "Parent Last Name": "",
+                          "Parent Email": "",
+                          "Parent Phone Number": "",
+                          "Parent Date of Birth": "",
+                          "Address": "",
+                          "Observer Account linked with student": observer_linked,
+                      }
+
+              except Exception as e:
+                  print(f"[warn] failed student {uid}: {e}", file=sys.stderr)
+                  continue
+
+          out = "Canvas_Enrollments.csv"
+          headers = [
+            "Enrollment Key","Student Canvas ID","Student Name","School Year","Program",
+            "Initial Enrollment Date","Year Start Date","Year Completion Date",
+            "Overall Current Score","Overall Final Score","Notes","Total Courses",
+            "Year Total Assignments","Year Completed Assignments","Year Unsubmitted Assignments",
+            "Student First Name","Student Last Name","Student ID nese ka (per SCS)",
+            "Student Date of Birth","Email","Parent First Name","Parent Last Name",
+            "Parent Email","Parent Phone Number","Parent Date of Birth","Address",
+            "Observer Account linked with student"
+          ]
+          with open(out, "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=headers)
               w.writeheader()
-              for row in r:
-                  if str(row.get("Student Canvas ID","")).strip() in ids:
-                      w.writerow(row); kept += 1
-          print(f"[ok] wrote {dst} with {kept} rows.")
+              for row in aggregates.values():
+                  w.writerow({h: row.get(h, "") for h in headers})
+
+          print(f"[ok] wrote {out} with {len(aggregates)} rows.")
           PY
 
-      - name: Upsert Student Enrollments → Airtable (${{ matrix.table }})
+      - name: Upload CSVs (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: student-csvs-${{ matrix.key }}
+          path: "*.csv"
+
+      # ---------- Robust upsert (same style as your courses upsert) ----------
+      - name: Upsert Students → Airtable (${{ matrix.table }})
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_NAME: ${{ matrix.table }}
-          CSV_PATH:            "Canvas_Enrollments_for_upsert.csv"
-          UNIQUE_KEY:          "Enrollment Key"
-          AIRTABLE_TYPECAST:   "true"
-          AIRTABLE_SOFT_DELETE: ${{ matrix.soft_delete }}
         run: |
-          python scripts/upsert_csv_to_airtable.py
+          echo "Upserting into Airtable table: $AIRTABLE_TABLE_NAME"
+          python - <<'PY'
+          import os, csv, requests, time, sys, json
+          from urllib.parse import quote
+
+          base  = os.environ["AIRTABLE_BASE_ID"]
+          table = os.environ["AIRTABLE_TABLE_NAME"]
+          token = os.environ["AIRTABLE_PAT"]
+          api   = f"https://api.airtable.com/v0/{base}/{quote(table, safe='')}"
+          hdr   = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+          def batched(lst, n=10):
+              for i in range(0, len(lst), n):
+                  yield lst[i:i+n]
+
+          # 1) Read CSV
+          with open("Canvas_Enrollments.csv", newline="", encoding="utf-8") as f:
+              rows = list(csv.DictReader(f))
+
+          # 2) Fetch existing (id, key) to build map
+          existing = {}
+          offset = None
+          while True:
+              params = {"pageSize": 100}
+              if offset: params["offset"] = offset
+              r = requests.get(api, headers=hdr, params=params, timeout=60)
+              if not r.ok:
+                  print(f("[error] Read existing failed {r.status_code}: {r.text}"))
+                  r.raise_for_status()
+              data = r.json()
+              for rec in data.get("records", []):
+                  key = (rec.get("fields",{}).get("Enrollment Key") or "").strip()
+                  if key:
+                      existing[key] = rec["id"]
+              offset = data.get("offset")
+              if not offset: break
+
+          # 3) Split into updates vs creates
+          updates, creates = [], []
+          for row in rows:
+              key = (row.get("Enrollment Key") or "").strip()
+              if not key:
+                  continue
+              if key in existing:
+                  updates.append({"id": existing[key], "fields": row})
+              else:
+                  creates.append({"fields": row})
+
+          # 4) PATCH updates
+          total_upd = total_new = 0
+          for batch in batched(updates, 10):
+              r = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if r.status_code in (429,500,502,503,504):
+                  time.sleep(2); r = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if not r.ok:
+                  print(f"[error] PATCH failed {r.status_code}: {r.text}")
+                  r.raise_for_status()
+              total_upd += len(batch)
+
+          # 5) POST creates
+          for batch in batched(creates, 10):
+              r = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if r.status_code in (429,500,502,503,504):
+                  time.sleep(2); r = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+              if not r.ok:
+                  print(f"[error] POST failed {r.status_code}: {r.text}")
+                  r.raise_for_status()
+              total_new += len(batch)
+
+          print(f"[ok] upsert complete. Updated={total_upd}, Created={total_new}")
+          PY
+
+      - name: Mark missing STUDENT records as inactive (soft-delete)
+        if: ${{ matrix.soft_delete != 'false' }}
+        env:
+          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
+        run: |
+          python - <<'PY'
+          import os, csv, requests, time, sys
+          from urllib.parse import quote
+
+          BASE  = os.environ["AIRTABLE_BASE_ID"]
+          TABLE = os.environ["AIRTABLE_TABLE_NAME"]
+          TOKEN = os.environ["AIRTABLE_PAT"]
+          API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
+          H     = {"Authorization": f"Bearer {TOKEN}"}
+
+          current_keys = set()
+          with open("Canvas_Enrollments.csv", newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+              k = (r.get("Enrollment Key") or "").strip()
+              if k: current_keys.add(k)
+
+          existing = []
+          offset = None
+          while True:
+            params = {"pageSize": 100}
+            if offset: params["offset"] = offset
+            r = requests.get(API, headers=H, params=params, timeout=60)
+            r.raise_for_status()
+            j = r.json()
+            for rec in j.get("records", []):
+              fields = rec.get("fields", {})
+              key = (fields.get("Enrollment Key") or "").strip()
+              if key:
+                existing.append((rec["id"], key))
+            offset = j.get("offset")
+            if not offset: break
+
+          to_mark = [rid for rid, key in existing if key not in current_keys]
+          print(f"[info] Existing: {len(existing)}, Current: {len(current_keys)}, Inactive to mark: {len(to_mark)}")
+
+          try:
+            for i in range(0, len(to_mark), 10):
+              batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
+              r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
+                                 json={"records": batch, "typecast": True}, timeout=60)
+              if r.status_code in (429,500,502,503,504):
+                time.sleep(2)
+                r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
+                                   json={"records": batch, "typecast": True}, timeout=60)
+              r.raise_for_status()
+            print("[ok] soft-delete complete")
+          except requests.HTTPError as e:
+            print(f"[warn] Soft-delete skipped for table '{TABLE}': {e}. "
+                  f"Add an 'Active' checkbox field to enable soft-delete.")
+            sys.exit(0)
+          PY
+
+  # Union soft-delete for B2C across P1/P2 (Students)
+  softdelete-b2c-students:
+    needs: run-export-students
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download B2C P1 CSV
+        uses: actions/download-artifact@v4
+        with:
+          name: student-csvs-B2C_P1
+          path: b2c-p1
+      - name: Download B2C P2 CSV
+        uses: actions/download-artifact@v4
+        with:
+          name: student-csvs-B2C_P2
+          path: b2c-p2
+
+      - name: Union soft-delete for B2C Students
+        env:
+          AIRTABLE_PAT:     ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+        run: |
+          python - <<'PY'
+          import os, csv, requests, time, sys
+          from urllib.parse import quote
+
+          TABLE = "B2C Student Enrollments"
+          BASE  = os.environ["AIRTABLE_BASE_ID"]
+          TOKEN = os.environ["AIRTABLE_PAT"]
+          API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
+          H     = {"Authorization": f"Bearer {TOKEN}"}
+
+          # Union of Enrollment Keys from both chunks
+          keyset = set()
+          for folder in ("b2c-p1","b2c-p2"):
+              if not os.path.isdir(folder): continue
+              for name in os.listdir(folder):
+                  if name.endswith(".csv"):
+                      with open(os.path.join(folder, name), newline="", encoding="utf-8") as f:
+                          for r in csv.DictReader(f):
+                              k = (r.get("Enrollment Key") or "").strip()
+                              if k: keyset.add(k)
+          if not keyset:
+              print("[warn] No Enrollment Keys from B2C chunks; skipping soft-delete."); sys.exit(0)
+
+          # Fetch existing keys
+          existing = []
+          offset = None
+          while True:
+              params = {"pageSize": 100}
+              if offset: params["offset"] = offset
+              r = requests.get(API, headers=H, params=params, timeout=60); r.raise_for_status()
+              j = r.json()
+              for rec in j.get("records", []):
+                  k = (rec.get("fields",{}).get("Enrollment Key") or "").strip()
+                  if k: existing.append((rec["id"], k))
+              offset = j.get("offset")
+              if not offset: break
+
+          to_mark = [rid for rid, k in existing if k not in keyset]
+          for i in range(0, len(to_mark), 10):
+              batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
+              r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
+                                 json={"records": batch, "typecast": True}, timeout=60)
+              if r.status_code in (429,500,502,503,504):
+                  time.sleep(2)
+                  r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
+                                     json={"records": batch, "typecast": True}, timeout=60)
+              r.raise_for_status()
+          print("[ok] B2C student union soft-delete complete")
+          PY
