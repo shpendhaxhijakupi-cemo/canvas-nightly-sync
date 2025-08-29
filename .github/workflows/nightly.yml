@@ -244,7 +244,7 @@ jobs:
           name: canvas-csvs-${{ matrix.key }}
           path: "*.csv"
 
-      # ---------- ROBUST UPSERT (no performUpsert) ----------
+      # ---------- Robust upsert ----------
       - name: Upsert Courses → Airtable (${{ matrix.table }})
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
@@ -253,7 +253,7 @@ jobs:
         run: |
           echo "Upserting into Airtable table: $AIRTABLE_TABLE_NAME"
           python - <<'PY'
-          import os, csv, requests, time, sys, json
+          import os, csv, requests, time
           from urllib.parse import quote
 
           base  = os.environ["AIRTABLE_BASE_ID"]
@@ -266,11 +266,9 @@ jobs:
               for i in range(0, len(lst), n):
                   yield lst[i:i+n]
 
-          # 1) Read CSV
           with open("Canvas_Enrollment_Courses_for_upsert.csv", newline="", encoding="utf-8") as f:
               rows = list(csv.DictReader(f))
 
-          # 2) Fetch existing (id, key) to build map
           existing = {}
           offset = None
           while True:
@@ -288,18 +286,15 @@ jobs:
               offset = data.get("offset")
               if not offset: break
 
-          # 3) Split into updates vs creates
           updates, creates = [], []
           for row in rows:
               key = (row.get("Enrollment Course Key") or "").strip()
-              if not key:
-                  continue
+              if not key: continue
               if key in existing:
                   updates.append({"id": existing[key], "fields": row})
               else:
                   creates.append({"fields": row})
 
-          # 4) PATCH updates
           total_upd = total_new = 0
           for batch in batched(updates, 10):
               r = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
@@ -310,7 +305,6 @@ jobs:
                   r.raise_for_status()
               total_upd += len(batch)
 
-          # 5) POST creates
           for batch in batched(creates, 10):
               r = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
               if r.status_code in (429,500,502,503,504):
@@ -323,7 +317,7 @@ jobs:
           print(f"[ok] upsert complete. Updated={total_upd}, Created={total_new}")
           PY
 
-      # NEW: Mark all current rows Active=true (so soft-delete can flip others to false)
+      # ---------- Ensure current rows are Active=true ----------
       - name: Ensure current rows are Active=true
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
@@ -344,7 +338,6 @@ jobs:
               print("[warn] Missing env for Ensure Active=true; skipping.")
               raise SystemExit(0)
 
-          # Resolve CSV path(s)
           paths = []
           if csv_path and os.path.exists(csv_path):
               paths = [csv_path]
@@ -355,7 +348,6 @@ jobs:
               print("[warn] No course CSV found; skipping Active=true step.")
               raise SystemExit(0)
 
-          # Collect keys
           keys = set()
           for p in paths:
               with open(p, newline="", encoding="utf-8") as f:
@@ -371,7 +363,6 @@ jobs:
           api = f"https://api.airtable.com/v0/{base}/{quote(table, safe='')}"
           headers = {"Authorization": f"Bearer {token}"}
 
-          # Build map key->record id
           id_by_key = {}
           offset = None
           while True:
@@ -421,6 +412,7 @@ jobs:
               raise
           PY
 
+      # ---------- Soft-delete (Active=false) ----------
       - name: Mark missing records as inactive (soft-delete)
         if: ${{ matrix.soft_delete != 'false' }}
         env:
@@ -480,6 +472,7 @@ jobs:
             sys.exit(0)
           PY
 
+  # ---------- Union soft-delete for B2C (P1+P2) ----------
   softdelete-b2c:
     needs: run-export
     runs-on: ubuntu-24.04
