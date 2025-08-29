@@ -79,7 +79,7 @@ jobs:
             *) echo "Unknown cohort key: ${{ matrix.key }}"; exit 1 ;;
           esac
 
-      # ---------- Build per-student-year CSV ----------
+      # ---------- Build per-student-year CSV (robust School Year + debug) ----------
       - name: Build per-student CSV for Airtable (${{ matrix.table }})
         env:
           API_URL: ${{ secrets.CANVAS_API_URL }}
@@ -98,9 +98,10 @@ jobs:
           PER_PAGE = 100
           START_MONTH = 8  # school year rollover (Aug)
 
-          def iso(dt): return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
+          def iso(dt):
+              return datetime.fromisoformat(dt.replace("Z","+00:00")) if dt else None
+
           def school_year(dt):
-              if not dt: return ""
               y = dt.year
               return f"{y-1}-{y}" if dt.month < START_MONTH else f"{y}-{y+1}"
 
@@ -128,6 +129,10 @@ jobs:
               print("[fatal] No Canvas IDs provided for this cohort.", file=sys.stderr)
               sys.exit(1)
 
+          print(f"[debug] Resolved Canvas IDs: {len(IDS)}")
+          out_rows = 0
+          debug_enr = 0
+
           aggregates = {}  # key -> row
 
           for uid in IDS:
@@ -137,13 +142,31 @@ jobs:
                   student_name = p.get("name") or f"User {uid}"
                   email = p.get("primary_email") or p.get("login_id") or ""
 
-                  enrollments = list(paged(f"{API_URL}/users/{uid}/enrollments",
-                                           {"type[]":"StudentEnrollment","include[]":"grades","per_page":PER_PAGE}))
+                  enrollments = list(paged(
+                      f"{API_URL}/users/{uid}/enrollments",
+                      {"type[]":"StudentEnrollment","include[]":"grades","per_page":PER_PAGE}
+                  ))
+                  debug_enr += len(enrollments)
+
                   by_year = {}
+                  from datetime import datetime as _dt
                   for enr in enrollments:
-                      created = iso(enr.get("created_at"))
-                      sy = school_year(created) or "unknown"
-                      if sy == "unknown": continue
+                      # Robust timestamp deduction for school year
+                      dt = iso(enr.get("created_at")) or iso(enr.get("updated_at")) or iso(enr.get("start_at"))
+                      if not dt:
+                          cid = enr.get("course_id")
+                          if cid:
+                              try:
+                                  c = requests.get(f"{API_URL}/courses/{cid}", headers=HEADERS, timeout=30)
+                                  if c.ok:
+                                      cj = c.json()
+                                      dt = iso(cj.get("start_at")) or iso(cj.get("end_at"))
+                              except Exception:
+                                  pass
+                      if not dt:
+                          dt = _dt.utcnow()  # final fallback so we never drop the row
+
+                      sy = school_year(dt)
                       by_year.setdefault(sy, []).append(enr)
 
                   for sy, enrs in by_year.items():
@@ -194,7 +217,8 @@ jobs:
                                                    {"type[]":"ObserverEnrollment","include[]":"user","per_page":PER_PAGE}):
                                       if int(obs.get("associated_user_id") or 0) == int(uid):
                                           observer_linked = "Yes"; break
-                              except Exception: pass
+                              except Exception:
+                                  pass
 
                       def avg(nums):
                           try:
@@ -232,6 +256,7 @@ jobs:
                           "Address": "",
                           "Observer Account linked with student": observer_linked,
                       }
+
               except Exception as e:
                   print(f"[warn] failed student {uid}: {e}", file=sys.stderr)
                   continue
@@ -252,72 +277,21 @@ jobs:
               w.writeheader()
               for row in aggregates.values():
                   w.writerow({h: row.get(h, "") for h in headers})
+                  out_rows += 1
 
-          print(f"[ok] wrote {out} with {len(aggregates)} rows.")
+          print(f"[ok] wrote {out} with {out_rows} rows. (IDs={len(IDS)}, Enrollments fetched={debug_enr})")
           PY
+
+      - name: Preview first 30 lines of CSV
+        run: |
+          echo "----- Canvas_Enrollments.csv (head) -----"
+          sed -n '1,30p' Canvas_Enrollments.csv || true
 
       - name: Upload CSVs (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: student-csvs-${{ matrix.key }}
           path: "*.csv"
-
-      # Ensure current run rows are Active=true so new/updated rows are active
-      - name: Ensure current STUDENT rows are Active=true
-        if: ${{ matrix.soft_delete != 'false' }}
-        env:
-          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
-          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
-        run: |
-          python - <<'PY'
-          import os, csv, requests, sys
-          from urllib.parse import quote
-
-          BASE  = os.environ["AIRTABLE_BASE_ID"]
-          TABLE = os.environ["AIRTABLE_TABLE_NAME"]
-          TOKEN = os.environ["AIRTABLE_PAT"]
-          API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
-          H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type":"application/json"}
-
-          def s(v): return str(v).strip() if v is not None else ""
-
-          keys = []
-          try:
-            with open("Canvas_Enrollments.csv", newline="", encoding="utf-8") as f:
-              for r in csv.DictReader(f):
-                k = s(r.get("Enrollment Key"))
-                if k: keys.append(k)
-          except FileNotFoundError:
-            print("[warn] No Enrollment Keys in CSV; skipping Active=true step.")
-            sys.exit(0)
-
-          if not keys:
-            print("[warn] No Enrollment Keys in CSV; skipping Active=true step.")
-            sys.exit(0)
-
-          existing = {}
-          offset = None
-          while True:
-            params = {"pageSize": 100}
-            if offset: params["offset"] = offset
-            r = requests.get(API, headers={"Authorization": f"Bearer {TOKEN}"}, params=params, timeout=60)
-            r.raise_for_status()
-            j = r.json()
-            for rec in j.get("records", []):
-              key = s((rec.get("fields", {}) or {}).get("Enrollment Key"))
-              if key: existing[key] = rec["id"]
-            offset = j.get("offset")
-            if not offset: break
-
-          to_true = [existing[k] for k in keys if k in existing]
-          for i in range(0, len(to_true), 10):
-            batch = [{"id": rid, "fields": {"Active": True}} for rid in to_true[i:i+10]]
-            r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
-            if not r.ok and r.status_code not in (404, 422):
-              r.raise_for_status()
-          print(f"[ok] ensured {len(to_true)} rows Active=true.")
-          PY
 
       # ---------- Upsert (auto-trim to Airtable's existing fields; always include key) ----------
       - name: Upsert Students → Airtable (${{ matrix.table }})
@@ -429,6 +403,62 @@ jobs:
               total_new += len(batch)
 
           print(f"[ok] upsert complete. Updated={total_upd}, Created={total_new}")
+          PY
+
+      # ---------- Ensure current rows are Active=true (after upsert) ----------
+      - name: Ensure current STUDENT rows are Active=true
+        env:
+          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
+        run: |
+          python - <<'PY'
+          import os, csv, requests, time, sys
+          from urllib.parse import quote
+          BASE  = os.environ["AIRTABLE_BASE_ID"]
+          TABLE = os.environ["AIRTABLE_TABLE_NAME"]
+          TOKEN = os.environ["AIRTABLE_PAT"]
+          API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
+          H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type":"application/json"}
+
+          def s(v): return str(v).strip() if v is not None else ""
+
+          # Read current keys
+          keys = set()
+          with open("Canvas_Enrollments.csv", newline="", encoding="utf-8") as f:
+              for r in csv.DictReader(f):
+                  k = s(r.get("Enrollment Key"))
+                  if k: keys.add(k)
+
+          if not keys:
+              print("[warn] No Enrollment Keys in CSV; skipping Active=true step.")
+              sys.exit(0)
+
+          # Fetch existing (id, key)
+          existing = []
+          offset = None
+          while True:
+              params = {"pageSize": 100}
+              if offset: params["offset"] = offset
+              resp = requests.get(API, headers={"Authorization": f"Bearer {TOKEN}"}, params=params, timeout=60)
+              resp.raise_for_status()
+              j = resp.json()
+              for rec in j.get("records", []):
+                  f = rec.get("fields", {})
+                  key = s(f.get("Enrollment Key"))
+                  if key: existing.append((rec["id"], key))
+              offset = j.get("offset")
+              if not offset: break
+
+          to_mark_true = [rid for rid, key in existing if key in keys]
+          for i in range(0, len(to_mark_true), 10):
+              batch = [{"id": rid, "fields": {"Active": True}} for rid in to_mark_true[i:i+10]]
+              r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
+              if r.status_code in (429,500,502,503,504):
+                  time.sleep(2)
+                  r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
+              r.raise_for_status()
+          print(f"[ok] set Active=true for {len(to_mark_true)} records.")
           PY
 
       # ---------- Soft-delete (mark Inactive) ----------
