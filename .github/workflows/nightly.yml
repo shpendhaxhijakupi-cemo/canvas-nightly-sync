@@ -244,7 +244,7 @@ jobs:
           name: canvas-csvs-${{ matrix.key }}
           path: "*.csv"
 
-      # ---------- Robust upsert ----------
+      # ---------- Upsert without performUpsert ----------
       - name: Upsert Courses → Airtable (${{ matrix.table }})
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
@@ -289,7 +289,8 @@ jobs:
           updates, creates = [], []
           for row in rows:
               key = (row.get("Enrollment Course Key") or "").strip()
-              if not key: continue
+              if not key:
+                  continue
               if key in existing:
                   updates.append({"id": existing[key], "fields": row})
               else:
@@ -317,102 +318,109 @@ jobs:
           print(f"[ok] upsert complete. Updated={total_upd}, Created={total_new}")
           PY
 
-      # ---------- Ensure current rows are Active=true ----------
+      # ---------- Ensure current rows are Active=true (robust) ----------
       - name: Ensure current rows are Active=true
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_NAME: ${{ matrix.table }}
-          COURSE_CSV:          Canvas_Enrollment_Courses_for_upsert.csv
         run: |
           python - <<'PY'
-          import os, csv, requests, time, glob
+          import os, csv, glob, time, requests
           from urllib.parse import quote
 
-          table = os.getenv("AIRTABLE_TABLE_NAME")
-          base  = os.getenv("AIRTABLE_BASE_ID")
-          token = os.getenv("AIRTABLE_PAT")
-          csv_path = os.getenv("COURSE_CSV")
+          TABLE = os.getenv("AIRTABLE_TABLE_NAME")
+          BASE  = os.getenv("AIRTABLE_BASE_ID")
+          TOKEN = os.getenv("AIRTABLE_PAT")
+          API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
+          HDRS  = {"Authorization": f"Bearer {TOKEN}"}
 
-          if not table or not base or not token:
-              print("[warn] Missing env for Ensure Active=true; skipping.")
-              raise SystemExit(0)
-
-          paths = []
-          if csv_path and os.path.exists(csv_path):
-              paths = [csv_path]
-          else:
-              paths = sorted(glob.glob("*Enrollment_Courses*.csv"))
-
-          if not paths:
-              print("[warn] No course CSV found; skipping Active=true step.")
-              raise SystemExit(0)
+          # Look in both canonical files and any *Enrollment_Courses*.csv
+          candidates = []
+          for name in [
+              "Canvas_Enrollment_Courses_for_upsert.csv",
+              "Canvas_Enrollment_Courses.csv",
+          ]:
+              if os.path.exists(name):
+                  candidates.append(name)
+          for p in sorted(glob.glob("*Enrollment_Courses*.csv")):
+              if p not in candidates:
+                  candidates.append(p)
 
           keys = set()
-          for p in paths:
-              with open(p, newline="", encoding="utf-8") as f:
-                  for row in csv.DictReader(f):
-                      k = (row.get("Enrollment Course Key") or "").strip()
-                      if k:
-                          keys.add(k)
+          for path in candidates:
+              try:
+                  with open(path, newline="", encoding="utf-8") as f:
+                      r = csv.DictReader(f)
+                      if not r.fieldnames:
+                          continue
+                      col = None
+                      for h in r.fieldnames:
+                          if h.strip().lower() == "enrollment course key":
+                              col = h
+                              break
+                      if not col:
+                          continue
+                      for row in r:
+                          k = (row.get(col) or "").strip()
+                          if k:
+                              keys.add(k)
+              except Exception as e:
+                  print(f"[warn] Unable to read {path}: {e}")
 
           if not keys:
-              print("[warn] No Enrollment Course Keys in CSV; nothing to activate.")
+              print("[warn] No Enrollment Course Keys found in any CSV; skipping Active=true step.")
               raise SystemExit(0)
 
-          api = f"https://api.airtable.com/v0/{base}/{quote(table, safe='')}"
-          headers = {"Authorization": f"Bearer {token}"}
-
+          # Build key -> recordId map
           id_by_key = {}
           offset = None
           while True:
               params = {"pageSize": 100}
-              if offset: params["offset"] = offset
-              r = requests.get(api, headers=headers, params=params, timeout=60); r.raise_for_status()
-              j = r.json()
-              for rec in j.get("records", []):
-                  f = rec.get("fields", {})
-                  k = (f.get("Enrollment Course Key") or "").strip()
-                  if k:
-                      id_by_key[k] = rec["id"]
-              offset = j.get("offset")
-              if not offset: break
+              if offset:
+                  params["offset"] = offset
+              r = requests.get(API, headers=HDRS, params=params, timeout=60)
+              r.raise_for_status()
+              data = r.json()
+              for rec in data.get("records", []):
+                  fields = rec.get("fields", {})
+                  key = (fields.get("Enrollment Course Key") or "").strip()
+                  if key:
+                      id_by_key[key] = rec["id"]
+              offset = data.get("offset")
+              if not offset:
+                  break
 
           to_patch = [{"id": id_by_key[k], "fields": {"Active": True}} for k in keys if k in id_by_key]
-
           if not to_patch:
-              print("[info] No matching records to mark Active=true.")
+              print("[info] No matching Airtable records to mark Active=true.")
               raise SystemExit(0)
 
-          def patch(batch):
+          def do_patch(batch):
               r = requests.patch(
-                  api,
-                  headers={**headers, "Content-Type": "application/json"},
+                  API,
+                  headers={**HDRS, "Content-Type": "application/json"},
                   json={"records": batch, "typecast": True},
                   timeout=60,
               )
               if r.status_code in (429,500,502,503,504):
                   time.sleep(2)
                   r = requests.patch(
-                      api,
-                      headers={**headers, "Content-Type": "application/json"},
+                      API,
+                      headers={**HDRS, "Content-Type": "application/json"},
                       json={"records": batch, "typecast": True},
                       timeout=60,
                   )
               r.raise_for_status()
 
-          try:
-              for i in range(0, len(to_patch), 10):
-                  patch(to_patch[i:i+10])
-              print(f"[ok] Marked {len(to_patch)} records Active=true in '{table}'.")
-          except requests.HTTPError as e:
-              if getattr(e.response, "status_code", None) == 422:
-                  print(f"[warn] Could not write 'Active' (missing checkbox field?) for '{table}'.")
-                  raise SystemExit(0)
-              raise
+          count = 0
+          for i in range(0, len(to_patch), 10):
+              do_patch(to_patch[i:i+10])
+              count += len(to_patch[i:i+10])
+
+          print(f"[ok] Marked {count} records Active=true in '{TABLE}'.")
           PY
 
-      # ---------- Soft-delete (Active=false) ----------
       - name: Mark missing records as inactive (soft-delete)
         if: ${{ matrix.soft_delete != 'false' }}
         env:
@@ -428,14 +436,16 @@ jobs:
           TABLE = os.environ["AIRTABLE_TABLE_NAME"]
           TOKEN = os.environ["AIRTABLE_PAT"]
           API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
-          H     = {"Authorization": f"Bearer {TOKEN}"}
+          H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
+          # Read current keys from the upsert CSV
           current_keys = set()
           with open("Canvas_Enrollment_Courses_for_upsert.csv", newline="", encoding="utf-8") as f:
             for r in csv.DictReader(f):
               k = (r.get("Enrollment Course Key") or "").strip()
               if k: current_keys.add(k)
 
+          # Fetch all existing records (id, key)
           existing = []
           offset = None
           while True:
@@ -458,21 +468,18 @@ jobs:
           try:
             for i in range(0, len(to_mark), 10):
               batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
-              r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
-                                 json={"records": batch, "typecast": True}, timeout=60)
+              r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
               if r.status_code in (429,500,502,503,504):
                 time.sleep(2)
-                r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
-                                   json={"records": batch, "typecast": True}, timeout=60)
+                r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
               r.raise_for_status()
             print("[ok] soft-delete complete")
           except requests.HTTPError as e:
-            print(f"[warn] Soft-delete skipped for table '{TABLE}': {e}. "
-                  f"Add an 'Active' checkbox field to enable soft-delete.")
+            print(f"[warn] Soft-delete skipped for table '{TABLE}': {e}. Ensure an 'Active' checkbox exists.")
             sys.exit(0)
           PY
 
-  # ---------- Union soft-delete for B2C (P1+P2) ----------
+  # ---------- Union soft-delete across B2C chunks ----------
   softdelete-b2c:
     needs: run-export
     runs-on: ubuntu-24.04
@@ -502,9 +509,8 @@ jobs:
           BASE  = os.environ["AIRTABLE_BASE_ID"]
           TOKEN = os.environ["AIRTABLE_PAT"]
           API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
-          H     = {"Authorization": f"Bearer {TOKEN}"}
+          H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-          # union of keys from chunks
           keyset = set()
           for folder in ("b2c-p1","b2c-p2"):
               if not os.path.isdir(folder): continue
@@ -514,10 +520,10 @@ jobs:
                           for r in csv.DictReader(f):
                               k = (r.get("Enrollment Course Key") or "").strip()
                               if k: keyset.add(k)
+
           if not keyset:
               print("[warn] No keys from B2C chunks; skipping soft-delete."); sys.exit(0)
 
-          # fetch existing
           existing = []
           offset = None
           while True:
@@ -534,12 +540,10 @@ jobs:
           to_mark = [rid for rid, k in existing if k not in keyset]
           for i in range(0, len(to_mark), 10):
               batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
-              r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
-                                 json={"records": batch, "typecast": True}, timeout=60)
+              r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
               if r.status_code in (429,500,502,503,504):
                   time.sleep(2)
-                  r = requests.patch(API, headers={**H, "Content-Type":"application/json"},
-                                     json={"records": batch, "typecast": True}, timeout=60)
+                  r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
               r.raise_for_status()
           print("[ok] B2C union soft-delete complete")
           PY
