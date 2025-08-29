@@ -323,6 +323,104 @@ jobs:
           print(f"[ok] upsert complete. Updated={total_upd}, Created={total_new}")
           PY
 
+      # NEW: Mark all current rows Active=true (so soft-delete can flip others to false)
+      - name: Ensure current rows are Active=true
+        env:
+          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
+          COURSE_CSV:          Canvas_Enrollment_Courses_for_upsert.csv
+        run: |
+          python - <<'PY'
+          import os, csv, requests, time, glob
+          from urllib.parse import quote
+
+          table = os.getenv("AIRTABLE_TABLE_NAME")
+          base  = os.getenv("AIRTABLE_BASE_ID")
+          token = os.getenv("AIRTABLE_PAT")
+          csv_path = os.getenv("COURSE_CSV")
+
+          if not table or not base or not token:
+              print("[warn] Missing env for Ensure Active=true; skipping.")
+              raise SystemExit(0)
+
+          # Resolve CSV path(s)
+          paths = []
+          if csv_path and os.path.exists(csv_path):
+              paths = [csv_path]
+          else:
+              paths = sorted(glob.glob("*Enrollment_Courses*.csv"))
+
+          if not paths:
+              print("[warn] No course CSV found; skipping Active=true step.")
+              raise SystemExit(0)
+
+          # Collect keys
+          keys = set()
+          for p in paths:
+              with open(p, newline="", encoding="utf-8") as f:
+                  for row in csv.DictReader(f):
+                      k = (row.get("Enrollment Course Key") or "").strip()
+                      if k:
+                          keys.add(k)
+
+          if not keys:
+              print("[warn] No Enrollment Course Keys in CSV; nothing to activate.")
+              raise SystemExit(0)
+
+          api = f"https://api.airtable.com/v0/{base}/{quote(table, safe='')}"
+          headers = {"Authorization": f"Bearer {token}"}
+
+          # Build map key->record id
+          id_by_key = {}
+          offset = None
+          while True:
+              params = {"pageSize": 100}
+              if offset: params["offset"] = offset
+              r = requests.get(api, headers=headers, params=params, timeout=60); r.raise_for_status()
+              j = r.json()
+              for rec in j.get("records", []):
+                  f = rec.get("fields", {})
+                  k = (f.get("Enrollment Course Key") or "").strip()
+                  if k:
+                      id_by_key[k] = rec["id"]
+              offset = j.get("offset")
+              if not offset: break
+
+          to_patch = [{"id": id_by_key[k], "fields": {"Active": True}} for k in keys if k in id_by_key]
+
+          if not to_patch:
+              print("[info] No matching records to mark Active=true.")
+              raise SystemExit(0)
+
+          def patch(batch):
+              r = requests.patch(
+                  api,
+                  headers={**headers, "Content-Type": "application/json"},
+                  json={"records": batch, "typecast": True},
+                  timeout=60,
+              )
+              if r.status_code in (429,500,502,503,504):
+                  time.sleep(2)
+                  r = requests.patch(
+                      api,
+                      headers={**headers, "Content-Type": "application/json"},
+                      json={"records": batch, "typecast": True},
+                      timeout=60,
+                  )
+              r.raise_for_status()
+
+          try:
+              for i in range(0, len(to_patch), 10):
+                  patch(to_patch[i:i+10])
+              print(f"[ok] Marked {len(to_patch)} records Active=true in '{table}'.")
+          except requests.HTTPError as e:
+              if getattr(e.response, "status_code", None) == 422:
+                  print(f"[warn] Could not write 'Active' (missing checkbox field?) for '{table}'.")
+                  raise SystemExit(0)
+              raise
+          PY
+
       - name: Mark missing records as inactive (soft-delete)
         if: ${{ matrix.soft_delete != 'false' }}
         env:
