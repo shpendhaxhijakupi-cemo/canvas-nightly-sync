@@ -253,27 +253,7 @@ jobs:
               for row in aggregates.values():
                   w.writerow({h: row.get(h, "") for h in headers})
 
-          print(f="[ok] wrote {out} with {len(aggregates)} rows.")
-          PY
-
-      # (Optional) tiny inspector so you can see if a cohort exported 0 rows
-      - name: Inspect student CSV (debug)
-        run: |
-          python - <<'PY'
-          import csv, os
-          p = "Canvas_Enrollments.csv"
-          if not os.path.exists(p):
-              print("[fatal] CSV not found:", p)
-          else:
-              with open(p, newline="", encoding="utf-8") as f:
-                  rows = list(csv.reader(f))
-              print(f"[debug] {p} rows including header: {len(rows)}")
-              if rows:
-                  print("[debug] Headers:", rows[0])
-                  for r in rows[1:6]:
-                      print("[debug] Row:", r)
-              else:
-                  print("[debug] CSV is empty.")
+          print(f"[ok] wrote {out} with {len(aggregates)} rows.")
           PY
 
       - name: Upload CSVs (artifact)
@@ -281,6 +261,63 @@ jobs:
         with:
           name: student-csvs-${{ matrix.key }}
           path: "*.csv"
+
+      # Ensure current run rows are Active=true so new/updated rows are active
+      - name: Ensure current STUDENT rows are Active=true
+        if: ${{ matrix.soft_delete != 'false' }}
+        env:
+          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
+        run: |
+          python - <<'PY'
+          import os, csv, requests, sys
+          from urllib.parse import quote
+
+          BASE  = os.environ["AIRTABLE_BASE_ID"]
+          TABLE = os.environ["AIRTABLE_TABLE_NAME"]
+          TOKEN = os.environ["AIRTABLE_PAT"]
+          API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
+          H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type":"application/json"}
+
+          def s(v): return str(v).strip() if v is not None else ""
+
+          keys = []
+          try:
+            with open("Canvas_Enrollments.csv", newline="", encoding="utf-8") as f:
+              for r in csv.DictReader(f):
+                k = s(r.get("Enrollment Key"))
+                if k: keys.append(k)
+          except FileNotFoundError:
+            print("[warn] No Enrollment Keys in CSV; skipping Active=true step.")
+            sys.exit(0)
+
+          if not keys:
+            print("[warn] No Enrollment Keys in CSV; skipping Active=true step.")
+            sys.exit(0)
+
+          existing = {}
+          offset = None
+          while True:
+            params = {"pageSize": 100}
+            if offset: params["offset"] = offset
+            r = requests.get(API, headers={"Authorization": f"Bearer {TOKEN}"}, params=params, timeout=60)
+            r.raise_for_status()
+            j = r.json()
+            for rec in j.get("records", []):
+              key = s((rec.get("fields", {}) or {}).get("Enrollment Key"))
+              if key: existing[key] = rec["id"]
+            offset = j.get("offset")
+            if not offset: break
+
+          to_true = [existing[k] for k in keys if k in existing]
+          for i in range(0, len(to_true), 10):
+            batch = [{"id": rid, "fields": {"Active": True}} for rid in to_true[i:i+10]]
+            r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
+            if not r.ok and r.status_code not in (404, 422):
+              r.raise_for_status()
+          print(f"[ok] ensured {len(to_true)} rows Active=true.")
+          PY
 
       # ---------- Upsert (auto-trim to Airtable's existing fields; always include key) ----------
       - name: Upsert Students → Airtable (${{ matrix.table }})
@@ -337,6 +374,12 @@ jobs:
               print("[warn] Table appears empty; proceeding with only key + any matching fields in future pages.")
           existing_fields.add(KEY_FIELD)
 
+          # log skipped cols
+          skipped = [c for c in csv_headers if c not in existing_fields]
+          if skipped:
+              print("[info] Skipping CSV columns not present in Airtable:")
+              for s in skipped: print("  -", s)
+
           # map existing key -> record id
           existing_map = {}
           offset = None
@@ -388,62 +431,10 @@ jobs:
           print(f"[ok] upsert complete. Updated={total_upd}, Created={total_new}")
           PY
 
-      # ---------- Ensure current rows are Active=true ----------
-      - name: Ensure current STUDENT rows are Active=true
-        env:
-          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
-          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
-        run: |
-          python - <<'PY'
-          import os, csv, requests
-          from urllib.parse import quote
-
-          BASE  = os.environ["AIRTABLE_BASE_ID"]
-          TABLE = os.environ["AIRTABLE_TABLE_NAME"]
-          TOKEN = os.environ["AIRTABLE_PAT"]
-          API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
-          H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type":"application/json"}
-
-          # keys from CSV
-          keys = set()
-          try:
-            with open("Canvas_Enrollments.csv", newline="", encoding="utf-8") as f:
-              for r in csv.DictReader(f):
-                k = (r.get("Enrollment Key") or "").strip()
-                if k: keys.add(k)
-          except FileNotFoundError:
-            print("[warn] Canvas_Enrollments.csv not found; skip Active=true step.")
-            raise SystemExit(0)
-
-          if not keys:
-            print("[warn] No Enrollment Keys in CSV; skipping Active=true step.")
-            raise SystemExit(0)
-
-          # map key -> id for existing
-          existing = {}
-          offset = None
-          while True:
-            params = {"pageSize": 100}
-            if offset: params["offset"] = offset
-            r = requests.get(API, headers={"Authorization": f"Bearer {TOKEN}"}, params=params, timeout=60)
-            r.raise_for_status()
-            j = r.json()
-            for rec in j.get("records", []):
-              k = (rec.get("fields", {}).get("Enrollment Key") or "").strip()
-              if k: existing[k] = rec["id"]
-            offset = j.get("offset")
-            if not offset: break
-
-          ids = [existing[k] for k in keys if k in existing]
-          for i in range(0, len(ids), 10):
-            batch = [{"id": rid, "fields": {"Active": True}} for rid in ids[i:i+10]]
-            r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
-            r.raise_for_status()
-          print(f"[ok] Set Active=true for {len(ids)} records.")
-          PY
-
       # ---------- Soft-delete (mark Inactive) ----------
+      # Marks records Inactive if EITHER:
+      #  - Enrollment Key is missing this run, OR
+      #  - Student Canvas ID is not present this run (student left).
       - name: Mark missing STUDENT records as inactive (soft-delete)
         if: ${{ matrix.soft_delete != 'false' }}
         env:
