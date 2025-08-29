@@ -374,6 +374,70 @@ jobs:
           print(f"[ok] upsert complete. Updated={total_upd}, Created={total_new}")
           PY
 
+      # NEW: Mark all current rows Active=true so soft-delete only flips the missing ones
+      - name: Ensure current STUDENT rows are Active=true
+        env:
+          AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
+          AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ matrix.table }}
+        run: |
+          python - <<'PY'
+          import os, csv, requests, time
+          from urllib.parse import quote
+
+          base  = os.environ["AIRTABLE_BASE_ID"]
+          table = os.environ["AIRTABLE_TABLE_NAME"]
+          token = os.environ["AIRTABLE_PAT"]
+          api   = f"https://api.airtable.com/v0/{base}/{quote(table, safe='')}"
+          H     = {"Authorization": f"Bearer {token}", "Content-Type":"application/json"}
+
+          def s(v): return str(v).strip() if v is not None else ""
+
+          # Collect keys from the current CSV
+          keys = set()
+          with open("Canvas_Enrollments.csv", newline="", encoding="utf-8") as f:
+              for r in csv.DictReader(f):
+                  k = s(r.get("Enrollment Key"))
+                  if k: keys.add(k)
+
+          if not keys:
+              print("[warn] No Enrollment Keys in CSV; skipping Active=true step."); raise SystemExit(0)
+
+          # Build map key -> airtable record id
+          id_by_key = {}
+          offset = None
+          while True:
+              params = {"pageSize": 100}
+              if offset: params["offset"] = offset
+              r = requests.get(api, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=60)
+              r.raise_for_status()
+              j = r.json()
+              for rec in j.get("records", []):
+                  f = rec.get("fields", {})
+                  k = s(f.get("Enrollment Key"))
+                  if k: id_by_key[k] = rec["id"]
+              offset = j.get("offset")
+              if not offset: break
+
+          to_patch = [{"id": id_by_key[k], "fields": {"Active": True}} for k in keys if k in id_by_key]
+          if not to_patch:
+              print("[info] No matching records to mark Active=true."); raise SystemExit(0)
+
+          for i in range(0, len(to_patch), 10):
+              batch = to_patch[i:i+10]
+              rr = requests.patch(api, headers=H, json={"records": batch, "typecast": True}, timeout=60)
+              if rr.status_code in (429,500,502,503,504):
+                  time.sleep(2)
+                  rr = requests.patch(api, headers=H, json={"records": batch, "typecast": True}, timeout=60)
+              # If Active field is missing, Airtable returns 422
+              if rr.status_code == 422:
+                  print(f"[warn] Could not set 'Active'. Make sure the table '{table}' has an 'Active' checkbox.")
+                  raise SystemExit(0)
+              rr.raise_for_status()
+
+          print(f"[ok] Marked {len(to_patch)} student rows Active=true.")
+          PY
+
       # ---------- Soft-delete (mark Inactive) ----------
       # Marks records Inactive if EITHER:
       #  - Enrollment Key is missing this run, OR
