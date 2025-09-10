@@ -127,12 +127,32 @@ jobs:
                   if not nxt: break
                   url, params = nxt, None
 
+          # ---- cache for sub-account lookups
+          account_name_cache = {}  # account_id -> name
+
+          def get_account_name(account_id):
+              if not account_id:
+                  return ""
+              if account_id in account_name_cache:
+                  return account_name_cache[account_id]
+              # fetch /accounts/{id}
+              while True:
+                  r = requests.get(f"{API_URL}/accounts/{account_id}", headers=HEADERS, timeout=60)
+                  if r.status_code in (429,500,502,503,504):
+                      time.sleep(1); continue
+                  if not r.ok:
+                      account_name_cache[account_id] = ""
+                      return ""
+                  name = (r.json() or {}).get("name") or ""
+                  account_name_cache[account_id] = name
+                  return name
+
           out = "Canvas_Enrollment_Courses.csv"
           with open(out, "w", newline="", encoding="utf-8") as f:
               w = csv.writer(f)
               w.writerow([
                   "Enrollment Course Key","Enrollment Key","Student Canvas ID","Student Name",
-                  "School Year","Course ID","Course Code","Course Name",
+                  "School Year","Course ID","Course Code","Course Name","Sub-Account",
                   "Course Start Date","Course End Date","Assigned Teachers",
                   "Current Score","Final Score","Passed?",
                   "Total Assignments","Completed Assignments","Unsubmitted Assignments","% Completed"
@@ -157,6 +177,7 @@ jobs:
                           cur = grades.get("current_score")
                           fin = grades.get("final_score")
 
+                          # Course details
                           c = requests.get(f"{API_URL}/courses/{cid}", headers=HEADERS, timeout=60)
                           course = c.json() if c.ok else {}
                           cstart = iso(course.get("start_at")) or iso(enr.get("start_at"))
@@ -165,6 +186,10 @@ jobs:
                           if not (str(uid).strip() and str(cid).strip() and sy != "unknown"):
                               continue
 
+                          # Sub-Account name (immediate account for the course)
+                          subacct_name = get_account_name(course.get("account_id"))
+
+                          # Teachers
                           tnames = []
                           for t in paged(f"{API_URL}/courses/{cid}/enrollments",
                                          {"type[]":"TeacherEnrollment","per_page":PER_PAGE}):
@@ -173,11 +198,13 @@ jobs:
                               if nm: tnames.append(nm)
                           teachers = ", ".join(sorted(set(tnames)))
 
+                          # Passed?
                           passed = ""
                           try:
                               if fin is not None: passed = "Yes" if float(fin) >= 60.0 else "No"
                           except Exception: passed = ""
 
+                          # Assignment progress
                           total = comp = unsubmitted = 0
                           for a in paged(f"{API_URL}/courses/{cid}/assignments"):
                               nm = (a.get("name") or "")
@@ -206,7 +233,7 @@ jobs:
 
                           w.writerow([
                               key, enr_key, uid, name,
-                              sy, cid, course.get("course_code") or "", course.get("name") or "",
+                              sy, cid, course.get("course_code") or "", course.get("name") or "", subacct_name,
                               cstart.isoformat() if cstart else "",
                               cend.isoformat() if cend else "",
                               teachers,
@@ -470,8 +497,7 @@ jobs:
               batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
               r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
               if r.status_code in (429,500,502,503,504):
-                time.sleep(2)
-                r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
+                time.sleep(2); r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
               r.raise_for_status()
             print("[ok] soft-delete complete")
           except requests.HTTPError as e:
