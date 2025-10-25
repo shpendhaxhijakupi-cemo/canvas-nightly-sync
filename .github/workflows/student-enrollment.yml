@@ -336,13 +336,7 @@ jobs:
           echo "----- Canvas_Enrollments.csv (head) -----"
           head -n 30 Canvas_Enrollments.csv || true
 
-      - name: Upload CSVs (artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: student-csvs-${{ matrix.key }}
-          path: "*.csv"
-
-      # ---------- Upsert Students → Airtable (with empty-table fallback) ----------
+      # ---------- Upsert Students → Airtable (no trimming; send non-empty CSV fields) ----------
       - name: Upsert Students → Airtable (${{ matrix.table }})
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
@@ -350,7 +344,7 @@ jobs:
           AIRTABLE_TABLE_NAME: ${{ matrix.table }}
         run: |
           python - <<'PY'
-          import os, csv, requests, time, sys
+          import os, csv, requests, time, sys, json
           from urllib.parse import quote
 
           base  = os.environ["AIRTABLE_BASE_ID"]
@@ -364,33 +358,27 @@ jobs:
               for i in range(0, len(lst), n):
                   yield lst[i:i+n]
 
+          def norm_fields(row, headers):
+              out = {}
+              for k in headers:
+                  v = row.get(k)
+                  if k == KEY_FIELD:
+                      out[k] = v  # always keep key (even if empty string; upstream guarantees it's set)
+                  else:
+                      if v not in (None, ""):
+                          out[k] = v
+              return out
+
+          def err_text(resp):
+              try:
+                  return json.dumps(resp.json(), ensure_ascii=False)
+              except Exception:
+                  return resp.text
+
           with open("Canvas_Enrollments.csv", newline="", encoding="utf-8") as f:
               r = csv.DictReader(f)
               csv_headers = r.fieldnames or []
               rows = list(r)
-
-          # --- Discover existing fields from any existing rows
-          existing_fields = set()
-          offset = None
-          while True:
-              params = {"pageSize": 100}
-              if offset: params["offset"] = offset
-              rr = requests.get(api, headers=hdr, params=params, timeout=60); rr.raise_for_status()
-              data = rr.json()
-              for rec in data.get("records", []):
-                  for k in (rec.get("fields") or {}).keys():
-                      existing_fields.add(k)
-              offset = data.get("offset")
-              if not offset: break
-
-          # Always allow the key
-          existing_fields.add(KEY_FIELD)
-
-          # --- Fallback when table is empty (or only key discovered): use CSV headers
-          if len(existing_fields) <= 1:
-              existing_fields = set(csv_headers)
-              existing_fields.add(KEY_FIELD)
-              print(f"[info] Airtable table '{table}' appears empty; falling back to CSV headers for field set.")
 
           # map existing key -> id
           existing_map = {}
@@ -398,10 +386,11 @@ jobs:
           while True:
               params = {"pageSize": 100}
               if offset: params["offset"] = offset
-              rr = requests.get(api, headers=hdr, params=params, timeout=60); rr.raise_for_status()
+              rr = requests.get(api, headers=hdr, params=params, timeout=60)
+              rr.raise_for_status()
               j = rr.json()
               for rec in j.get("records", []):
-                  k = (rec.get("fields",{}) .get(KEY_FIELD) or "").strip()
+                  k = (rec.get("fields",{}).get(KEY_FIELD) or "").strip()
                   if k: existing_map[k] = rec["id"]
               offset = j.get("offset")
               if not offset: break
@@ -409,27 +398,35 @@ jobs:
           updates, creates = [], []
           for row in rows:
               key = (row.get(KEY_FIELD) or "").strip()
-              if not key:
+              if not key: 
                   continue
-              trimmed = {k: v for k, v in row.items() if k in existing_fields}
+              fields = norm_fields(row, csv_headers)
               if key in existing_map:
-                  updates.append({"id": existing_map[key], "fields": trimmed})
+                  updates.append({"id": existing_map[key], "fields": fields})
               else:
-                  creates.append({"fields": trimmed})
+                  creates.append({"fields": fields})
 
+          # updates
           for batch in batched(updates, 10):
               rr = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
               if rr.status_code in (429,500,502,503,504):
                   time.sleep(2); rr = requests.patch(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
-              rr.raise_for_status()
+              if not rr.ok:
+                  print(f"[error] PATCH failed {rr.status_code}: {err_text(rr)}")
+                  rr.raise_for_status()
 
-          for batch in batched(creates, 10):
-              rr = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
+          # creates
+          created = 0
+          for rec in creates:
+              rr = requests.post(api, headers=hdr, json={"records": [rec], "typecast": True}, timeout=60)
               if rr.status_code in (429,500,502,503,504):
-                  time.sleep(2); rr = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
-              rr.raise_for_status()
+                  time.sleep(2); rr = requests.post(api, headers=hdr, json={"records": [rec], "typecast": True}, timeout=60)
+              if not rr.ok:
+                  print(f"[error] POST failed {rr.status_code}: {err_text(rr)}")
+                  rr.raise_for_status()
+              created += 1
 
-          print(f"[ok] upsert complete: Updated={len(updates)}, Created={len(creates)}")
+          print(f"[ok] upsert complete: Updated={len(updates)}, Created={created}")
           PY
 
       # ---------- Ensure current STUDENT rows are Active=true ----------
