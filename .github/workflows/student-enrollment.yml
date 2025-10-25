@@ -363,7 +363,7 @@ jobs:
               for k in headers:
                   v = row.get(k)
                   if k == KEY_FIELD:
-                      out[k] = v  # always keep key (even if empty string; upstream guarantees it's set)
+                      out[k] = v
                   else:
                       if v not in (None, ""):
                           out[k] = v
@@ -398,7 +398,7 @@ jobs:
           updates, creates = [], []
           for row in rows:
               key = (row.get(KEY_FIELD) or "").strip()
-              if not key: 
+              if not key:
                   continue
               fields = norm_fields(row, csv_headers)
               if key in existing_map:
@@ -549,11 +549,14 @@ jobs:
     steps:
       - name: Download B2C P1 CSV
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: student-csvs-B2C_P1
           path: b2c-p1
+
       - name: Download B2C P2 CSV
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: student-csvs-B2C_P2
           path: b2c-p2
@@ -575,9 +578,25 @@ jobs:
           API   = f"https://api.airtable.com/v0/{BASE}/{quote(TABLE, safe='')}"
           H     = {"Authorization": f"Bearer {TOKEN}", "Content-Type":"application/json"}
 
+          # Which artifact folders have CSVs?
+          folders = []
+          for d in ("b2c-p1","b2c-p2"):
+              if os.path.isdir(d) and any(name.endswith(".csv") for name in os.listdir(d)):
+                  folders.append(d)
+
+          if not folders:
+              print("[warn] No B2C student artifacts found (P1/P2). Skipping union soft-delete.")
+              sys.exit(0)
+
+          if len(folders) == 1:
+              # SAFETY: don't soft-delete with a partial view
+              print(f"[warn] Only one B2C student artifact present ({folders[0]}). "
+                    "Skipping union soft-delete to avoid false inactivations.")
+              sys.exit(0)
+
+          # Both present -> build union of keys+sids
           keys, sids = set(), set()
-          for folder in ("b2c-p1","b2c-p2"):
-              if not os.path.isdir(folder): continue
+          for folder in folders:
               for name in os.listdir(folder):
                   if name.endswith(".csv"):
                       with open(os.path.join(folder, name), newline="", encoding="utf-8") as f:
@@ -588,20 +607,25 @@ jobs:
                               if sid: sids.add(sid)
 
           if not keys and not sids:
-              print("[warn] No keys or student IDs from B2C chunks; skipping soft-delete."); sys.exit(0)
+              print("[warn] No keys or student IDs parsed from artifacts; skipping soft-delete.")
+              sys.exit(0)
 
+          # Fetch existing rows in Airtable
           existing = []
           offset = None
           while True:
               params = {"pageSize": 100}
               if offset: params["offset"] = offset
-              r = requests.get(API, headers={"Authorization": f"Bearer {TOKEN}"}, params=params, timeout=60); r.raise_for_status()
+              r = requests.get(API, headers={"Authorization": f"Bearer {TOKEN}"}, params=params, timeout=60)
+              r.raise_for_status()
               j = r.json()
               for rec in j.get("records", []):
-                  f = rec.get("fields", {})
-                  k = s(f.get("Enrollment Key"))
-                  sid = s(f.get("Student Canvas ID"))
-                  existing.append((rec["id"], k, sid))
+                  flds = rec.get("fields", {})
+                  existing.append((
+                    rec["id"],
+                    s(flds.get("Enrollment Key")),
+                    s(flds.get("Student Canvas ID"))
+                  ))
               offset = j.get("offset")
               if not offset: break
 
@@ -610,7 +634,8 @@ jobs:
               batch = [{"id": rid, "fields": {"Active": False}} for rid in to_mark[i:i+10]]
               r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
               if r.status_code in (429,500,502,503,504):
-                  time.sleep(2); r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
+                time.sleep(2); r = requests.patch(API, headers=H, json={"records": batch, "typecast": True}, timeout=60)
               r.raise_for_status()
-          print("[ok] B2C student union soft-delete complete")
+
+          print(f"[ok] B2C student union soft-delete complete. Marked inactive: {len(to_mark)}")
           PY
