@@ -22,6 +22,7 @@ jobs:
           - key: B2C_P2
             table: "B2C Student Enrollments"
             soft_delete: "false"
+
           - key: SOUTHLANDS
             table: "Southlands Student Enrollments"
             soft_delete: "true"
@@ -341,7 +342,7 @@ jobs:
           name: student-csvs-${{ matrix.key }}
           path: "*.csv"
 
-      # ---------- Upsert Students → Airtable ----------
+      # ---------- Upsert Students → Airtable (with empty-table fallback) ----------
       - name: Upsert Students → Airtable (${{ matrix.table }})
         env:
           AIRTABLE_PAT:        ${{ secrets.AIRTABLE_PAT }}
@@ -368,7 +369,7 @@ jobs:
               csv_headers = r.fieldnames or []
               rows = list(r)
 
-          # discover fields present in Airtable (for trimming)
+          # --- Discover existing fields from any existing rows
           existing_fields = set()
           offset = None
           while True:
@@ -381,7 +382,15 @@ jobs:
                       existing_fields.add(k)
               offset = data.get("offset")
               if not offset: break
+
+          # Always allow the key
           existing_fields.add(KEY_FIELD)
+
+          # --- Fallback when table is empty (or only key discovered): use CSV headers
+          if len(existing_fields) <= 1:
+              existing_fields = set(csv_headers)
+              existing_fields.add(KEY_FIELD)
+              print(f"[info] Airtable table '{table}' appears empty; falling back to CSV headers for field set.")
 
           # map existing key -> id
           existing_map = {}
@@ -390,16 +399,18 @@ jobs:
               params = {"pageSize": 100}
               if offset: params["offset"] = offset
               rr = requests.get(api, headers=hdr, params=params, timeout=60); rr.raise_for_status()
-              for rec in rr.json().get("records", []):
-                  k = (rec.get("fields",{}).get(KEY_FIELD) or "").strip()
+              j = rr.json()
+              for rec in j.get("records", []):
+                  k = (rec.get("fields",{}) .get(KEY_FIELD) or "").strip()
                   if k: existing_map[k] = rec["id"]
-              offset = rr.json().get("offset")
+              offset = j.get("offset")
               if not offset: break
 
           updates, creates = [], []
           for row in rows:
               key = (row.get(KEY_FIELD) or "").strip()
-              if not key: continue
+              if not key:
+                  continue
               trimmed = {k: v for k, v in row.items() if k in existing_fields}
               if key in existing_map:
                   updates.append({"id": existing_map[key], "fields": trimmed})
@@ -418,7 +429,7 @@ jobs:
                   time.sleep(2); rr = requests.post(api, headers=hdr, json={"records": batch, "typecast": True}, timeout=60)
               rr.raise_for_status()
 
-          print("[ok] upsert complete")
+          print(f"[ok] upsert complete: Updated={len(updates)}, Created={len(creates)}")
           PY
 
       # ---------- Ensure current STUDENT rows are Active=true ----------
